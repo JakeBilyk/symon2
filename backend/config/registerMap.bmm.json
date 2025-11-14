@@ -1,0 +1,41 @@
+{
+  "byte_order": "BE",
+  "word_order": "CDAB",
+  "blocks": [
+    { "name": "status", "fn": 3, "start": 0,  "len": 40 },
+    { "name": "calib",  "fn": 3, "start": 50, "len": 12 }
+  ],
+  "points": {
+    "status_code":      { "addr": 0,  "type": "u16",    "ro": true },
+    "model_number":     { "addr": 1,  "type": "u16",    "ro": true },
+    "serial_number":    { "addr": 2,  "type": "u16",    "ro": true },
+    "firmware_rev":     { "addr": 3,  "type": "u16",    "ro": true },
+    "heartbeat_in":     { "addr": 4,  "type": "u16" },
+    "heartbeat_out":    { "addr": 5,  "type": "u16",    "ro": true },
+    "measure_stage":    { "addr": 6,  "type": "u16",    "ro": true },
+    "measurement_hour": { "addr": 7,  "type": "u16" },
+    "uptime_s":         { "addr": 8,  "type": "u32",    "ro": true },
+    "timezone_hours":   { "addr": 10, "type": "i16" },
+    "clock_year":       { "addr": 11, "type": "u16",    "ro": true },
+    "clock_month":      { "addr": 12, "type": "u16",    "ro": true },
+    "clock_day":        { "addr": 13, "type": "u16",    "ro": true },
+    "clock_hour":       { "addr": 14, "type": "u16",    "ro": true },
+    "clock_minute":     { "addr": 15, "type": "u16",    "ro": true },
+    "clock_second":     { "addr": 16, "type": "u16",    "ro": true },
+
+    "ch_red":           { "addr": 20, "type": "float32" },
+    "ch_green":         { "addr": 22, "type": "float32" },
+    "ch_blue":          { "addr": 24, "type": "float32" },
+    "ch_clear":         { "addr": 26, "type": "float32" },
+    "ci_rg":            { "addr": 28, "type": "float32" },
+    "ci_bg":            { "addr": 30, "type": "float32" },
+    "ci_rb":            { "addr": 32, "type": "float32" },
+    "biomass":          { "addr": 34, "type": "float32" },
+
+    "calib_k0":         { "addr": 50, "type": "float32" },
+    "calib_k1":         { "addr": 52, "type": "float32" },
+    "calib_k2":         { "addr": 54, "type": "float32" },
+    "calib_k3":         { "addr": 56, "type": "float32" },
+    "sensor_gain":      { "addr": 59, "type": "u16",    "ro": true }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "log_points": [
+    "line_pressure_psi",
+    "flow_rate_lpm",
+    "motor_current_A"
+  ]
+}

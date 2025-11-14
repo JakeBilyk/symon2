@@ -1,0 +1,65 @@
+{
+  "schema_ver": 1,
+  "model": "symbctrl-mk2",
+  "byte_order": "BE",
+  "word_order": "CDAB",
+
+  "blocks": [
+    { "name": "ident_status",  "fn": 3, "start": 0,   "len": 50 },
+    { "name": "calibration",   "fn": 3, "start": 50,  "len": 20 },
+    { "name": "control1",      "fn": 3, "start": 70,  "len": 20 },
+    { "name": "counters_timers","fn": 3, "start": 140, "len": 30 },
+    { "name": "text_fields",   "fn": 3, "start": 170, "len": 64 }
+  ],
+
+  "points": {
+    "status_code":          { "addr": 0,   "type": "u16",     "ro": true,  "desc": "0=OK; >0 controller fault code" },
+    "model_number":         { "addr": 1,   "type": "u16",     "ro": true },
+    "serial_number":        { "addr": 2,   "type": "u16",     "ro": true },
+    "fw_revision":          { "addr": 3,   "type": "u16",     "ro": true,  "desc": "major.minor packed" },
+
+    "relay1_status":        { "addr": 10,  "type": "u16",     "ro": true,  "desc": "latched state/report" },
+    "relay2_status":        { "addr": 11,  "type": "u16",     "ro": true },
+
+    "ph":                   { "addr": 20,  "type": "float32", "ro": true,  "units": "pH" },
+    "temp1_C":              { "addr": 22,  "type": "float32", "ro": true,  "units": "C" },
+    "temp2_C":              { "addr": 24,  "type": "float32", "ro": true,  "units": "C" },
+    "analog1":              { "addr": 26,  "type": "float32", "ro": true },
+    "analog2":              { "addr": 28,  "type": "float32", "ro": true },
+    "internal_temp_C":      { "addr": 30,  "type": "float32", "ro": true,  "units": "C" },
+
+    "ph_temp_comp_src":     { "addr": 44,  "type": "u16",     "ro": false, "safe_bounds": [0, 2], "desc": "0=off/1=temp1/2=temp2" },
+
+    "wq_offset":            { "addr": 50,  "type": "float32", "ro": false, "safe_bounds": [-2.0, 2.0] },
+    "temp1_offset":         { "addr": 52,  "type": "float32", "ro": false, "safe_bounds": [-5.0, 5.0] },
+    "temp2_offset":         { "addr": 54,  "type": "float32", "ro": false, "safe_bounds": [-5.0, 5.0] },
+    "analog1_offset":       { "addr": 56,  "type": "float32", "ro": false, "safe_bounds": [-10.0, 10.0] },
+    "analog2_offset":       { "addr": 58,  "type": "float32", "ro": false, "safe_bounds": [-10.0, 10.0] },
+
+    "temp1_gain":           { "addr": 62,  "type": "float32", "ro": false, "safe_bounds": [0.5, 1.5] },
+    "temp2_gain":           { "addr": 64,  "type": "float32", "ro": false, "safe_bounds": [0.5, 1.5] },
+    "analog1_gain":         { "addr": 66,  "type": "float32", "ro": false, "safe_bounds": [0.1, 10.0] },
+    "analog2_gain":         { "addr": 68,  "type": "float32", "ro": false, "safe_bounds": [0.1, 10.0] },
+
+    "ctl1_in_channel":      { "addr": 70,  "type": "u16",     "ro": false, "safe_bounds": [0, 8] },
+    "ctl1_out_channel":     { "addr": 71,  "type": "u16",     "ro": false, "safe_bounds": [0, 8] },
+    "ctl1_setpoint":        { "addr": 72,  "type": "float32", "ro": false, "safe_bounds": [6.5, 8.8], "deadband": 0.02, "units": "pH" },
+    "ctl1_hysteresis":      { "addr": 74,  "type": "float32", "ro": false, "safe_bounds": [0.0, 2.0] },
+    "ctl1_alarm_low":       { "addr": 76,  "type": "float32", "ro": false, "safe_bounds": [6.0, 8.6] },
+    "ctl1_alarm_high":      { "addr": 78,  "type": "float32", "ro": false, "safe_bounds": [6.2, 9.0] },
+    "ctl1_enable_src":      { "addr": 80,  "type": "u16",     "ro": false, "safe_bounds": [0, 2] },
+    "ctl1_min_onoff":       { "addr": 81,  "type": "u16",     "ro": false, "safe_bounds": [0, 600], "units": "s" },
+
+    "counter_src":          { "addr": 150, "type": "u16",     "ro": false },
+    "counter_value":        { "addr": 151, "type": "u32",     "ro": true },
+    "timer_src":            { "addr": 154, "type": "u16",     "ro": false },
+    "timer_seconds":        { "addr": 155, "type": "u32",     "ro": true },
+
+    "log_interval_min":     { "addr": 160, "type": "u16",     "ro": false, "safe_bounds": [1, 60] },
+    "log_records_available":{ "addr": 161, "type": "u16",     "ro": true },
+    "log_data_addr":        { "addr": 164, "type": "float32", "ro": true },
+
+    "relay1_request":       { "addr": 14,  "type": "u16",     "ro": false, "safe_bounds": [0, 1], "desc": "manual relay1 request" },
+    "relay2_request":       { "addr": 15,  "type": "u16",     "ro": false, "safe_bounds": [0, 1] }
+  }
+}

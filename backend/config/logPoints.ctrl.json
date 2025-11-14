@@ -1,0 +1,9 @@
+{
+  "log_points": [
+    "temp1_C",
+    "ph",
+    "internal_temp_C",
+    "counter_value",
+    "timer_seconds"
+  ]
+}

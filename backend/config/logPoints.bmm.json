@@ -1,0 +1,9 @@
+{
+  "log_points": [
+    "biomass",
+    "ch_clear",
+    "ch_red",
+    "ch_green",
+    "ch_blue"
+  ]
+}
