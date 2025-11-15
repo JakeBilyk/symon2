@@ -15,9 +15,9 @@ import { initLogger, logTelemetry, shutdownLogger, getLogDirectory } from "./log
 // ---- path helpers ----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
-const configDir  = path.join(__dirname, "..", "config");
+const projectRoot = path.join(__dirname, "..");
+const configDir   = path.join(projectRoot, "config");
 
-// ---- env / runtime knobs ----
 const SITE_ID        = process.env.SITE_ID || "dev01";
 const DEVICE_FW      = "gw-1.0.0";
 const POLL_MS        = Number(process.env.POLL_MS || 60_000);     // polling cadence
@@ -25,6 +25,20 @@ const CONCURRENCY    = Number(process.env.POLL_CONCURRENCY || 8); // worker pool
 const FAMILY_RELOAD_MS = Number(process.env.FAMILY_RELOAD_MS || 5 * 60_000);
 const API_PORT       = Number(process.env.API_PORT || 4000);
 const API_HOST       = process.env.API_HOST || "0.0.0.0";
+
+// ---- live snapshot cache for /api/live ----
+// Structure: liveCache[tankId] = { family, ip, ts_utc, qc, ...decodedValues }
+const liveCache = Object.create(null);
+
+function updateLiveCache(tankId, family, ip, payload) {
+  liveCache[tankId] = {
+    family,
+    ip,
+    ts_utc: payload.ts_utc,
+    qc: payload.qc?.status || "ok",
+    ...payload.s,
+  };
+}
 
 // ----  "live tanks" filter (applies to controllers) ----
 function liveTanksPath() {
@@ -71,38 +85,25 @@ function setSecurityHeaders(res) {
   if (!shouldDisableHsts) {
     res.setHeader("Strict-Transport-Security", STRICT_TRANSPORT_SECURITY);
   }
-  if (!res.hasHeader("Cache-Control")) {
-    res.setHeader("Cache-Control", "no-cache");
-  }
-  res.removeHeader("X-Powered-By");
-  res.removeHeader("Server");
-  res.setHeader("Server", "");
 }
 
 function setCorsHeaders(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+function sendJson(res, statusCode, body) {
+  if (res.writableEnded) return;
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  setCorsHeaders(res);
   setSecurityHeaders(res);
+  res.end(JSON.stringify(body));
 }
 
-function ensureJsonHeaders(res) {
-  if (!res.hasHeader("Content-Type")) {
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-  }
-}
-
-function sendJson(res, status, payload) {
-  if (!res.headersSent) {
-    setCorsHeaders(res);
-    ensureJsonHeaders(res);
-    res.statusCode = status;
-  }
-  res.end(JSON.stringify(payload));
-}
-
-function sendError(res, status, message) {
-  sendJson(res, status, { error: message });
+function sendError(res, statusCode, message) {
+  sendJson(res, statusCode, { error: message });
 }
 
 async function readRequestBody(req, limitBytes = 1_048_576) {
@@ -123,59 +124,79 @@ async function readRequestBody(req, limitBytes = 1_048_576) {
   });
 }
 
-function resolveMetricSpec(rawMetric) {
-  const m = (rawMetric || "ph").toLowerCase();
-  if (["temp", "temp_c", "temperature", "temp1_c"].includes(m)) {
-    return { id: "temp", key: "temp1_C", label: "Temperature (°C)" };
+function charIsDigit(ch) {
+  return ch >= "0" && ch <= "9";
+}
+
+// Very small parser: "ph" => { fam: null, field: "ph" }
+// "ctrl.ph" => { fam: "ctrl", field: "ph" }, etc.
+function resolveMetricSpec(raw) {
+  if (!raw) return null;
+  const value = String(raw).trim();
+  if (!value) return null;
+
+  const parts = value.split(".");
+  if (parts.length === 1) {
+    return { family: null, field: parts[0] };
   }
-  if (["ph", "pH"].includes(m)) {
-    return { id: "ph", key: "ph", label: "pH" };
+  if (parts.length === 2) {
+    const [fam, field] = parts;
+    return { family: fam || null, field };
   }
   return null;
 }
 
-async function readLogSeries(tankId, metricSpec, startMs, endMs) {
-  try {
-    const dir = getLogDirectory();
-    const files = await fsp.readdir(dir);
-    const prefix = "telemetry-ctrl-";
-    const out = [];
+// Parse NDJSON file path for logs
+function getLogFilePathsForTank(tankId) {
+  const dir = getLogDirectory();
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  const files = [];
+  for (const ent of entries) {
+    if (!ent.isFile()) continue;
+    if (!ent.name.endsWith(".ndjson")) continue;
+    if (!ent.name.includes(`.${tankId}.`)) continue;
+    files.push(path.join(dir, ent.name));
+  }
+  return files;
+}
 
-    for (const file of files) {
-      if (!file.startsWith(prefix) || !file.endsWith(".ndjson")) continue;
-      const fullPath = path.join(dir, file);
-      let raw;
+// read NDJSON logs and create a simple time series
+async function readLogSeries(tankId, metricSpec, startMs, endMs) {
+  const files = getLogFilePathsForTank(tankId);
+  if (!files.length) return [];
+
+  const out = [];
+
+  for (const f of files) {
+    const raw = await fsp.readFile(f, "utf8");
+    const lines = raw.split(/\r?\n/);
+    for (const line of lines) {
+      if (!line) continue;
+      let row;
       try {
-        raw = await fsp.readFile(fullPath, "utf8");
-      } catch (e) {
-        console.error("log read error:", file, e.message);
+        row = JSON.parse(line);
+      } catch {
+        continue; // skip invalid row
+      }
+      const t = Date.parse(row.ts_utc || row.ts || row.ts_local || row.time);
+      if (!Number.isFinite(t)) continue;
+      if (t < startMs || t > endMs) continue;
+
+      // optional family filter
+      if (metricSpec.family && row.family && row.family !== metricSpec.family) {
         continue;
       }
 
-      for (const line of raw.split(/\n+/)) {
-        if (!line.trim()) continue;
-        try {
-          const row = JSON.parse(line);
-          if ((row?.tank_id || row?.tankId) !== tankId) continue;
-          const tsMs = Date.parse(row?.ts_utc || row?.tsUtc || row?.tsUTC);
-          if (!Number.isFinite(tsMs) || tsMs < startMs || tsMs > endMs) continue;
+      const s = row.s || row.values || {};
+      const v = s[metricSpec.field];
+      if (typeof v !== "number" || !Number.isFinite(v)) continue;
 
-          const value = Number(row?.[metricSpec.key]);
-          if (!Number.isFinite(value)) continue;
-
-          out.push({ ts: new Date(tsMs).toISOString(), value });
-        } catch (e) {
-          console.error("log parse error:", file, e.message);
-        }
-      }
+      out.push({ t, v });
     }
-
-    out.sort((a, b) => a.ts.localeCompare(b.ts));
-    return out;
-  } catch (e) {
-    console.error("readLogSeries error:", e.message);
-    return [];
   }
+
+  out.sort((a, b) => a.t - b.t);
+  return out;
 }
 
 async function handleApiRequest(req, res) {
@@ -189,6 +210,18 @@ async function handleApiRequest(req, res) {
 
   const url = new URL(req.url || "/", "http://localhost");
   const { pathname, searchParams } = url;
+
+  // NEW: live snapshot endpoint
+  if (req.method === "GET" && pathname === "/api/live") {
+    const tankId = searchParams.get("tankId");
+    if (tankId) {
+      const entry = liveCache[tankId] || null;
+      sendJson(res, 200, { [tankId]: entry });
+      return;
+    }
+    sendJson(res, 200, liveCache);
+    return;
+  }
 
   if (req.method === "GET" && pathname === "/api/live-tanks") {
     const live = loadLiveTanks() || {};
@@ -209,26 +242,25 @@ async function handleApiRequest(req, res) {
       const normalized = {};
       for (const [tank, value] of Object.entries(next)) {
         if (typeof value !== "boolean") {
-          sendError(res, 400, `tank "${tank}" must map to a boolean`);
+          sendError(res, 400, `liveTanks.${tank} must be boolean`);
           return;
         }
         normalized[tank] = value;
       }
 
       await saveLiveTanks(normalized);
-      families = loadFamilies();
-      sendJson(res, 200, { ok: true, liveTanks: normalized });
+      sendJson(res, 200, { ok: true });
     } catch (e) {
-      console.error("live-tanks save error:", e.message);
-      sendError(res, 500, "failed to persist liveTanks");
+      console.error("POST /api/live-tanks error:", e.message);
+      sendError(res, 400, "invalid JSON");
     }
     return;
   }
 
   if (req.method === "GET" && pathname === "/api/tanks") {
-    const tanks = listTankIds();
     const live = loadLiveTanks() || {};
-    sendJson(res, 200, { tanks, liveTanks: live });
+    const all   = listTankIds();
+    sendJson(res, 200, { tanks: all, liveTanks: live });
     return;
   }
 
@@ -276,7 +308,6 @@ async function handleApiRequest(req, res) {
   sendError(res, 404, "Not found");
 }
 
-
 let apiServer;
 
 // ---- MQTT wiring ----
@@ -297,9 +328,14 @@ function createMqttClient() {
     clean: true,
   };
   const client = mqtt.connect(url, opts);
-  client.on("connect", () => console.log(`✅ MQTT connected → ${url}`));
+
+  client.on("connect", () => {
+    console.log(`✅ MQTT connected → ${url}`);
+  });
+  client.on("reconnect", () => console.log("… MQTT reconnecting …"));
   client.on("error", (e) => console.error("MQTT error:", e.message));
   client.on("close", () => console.log("MQTT connection closed"));
+
   return client;
 }
 
@@ -338,21 +374,15 @@ function loadFamilies() {
       return { tankId, ip: v.ip, unitId: v.unitId ?? 1 };
     });
 
-    // Filter inactive controller tanks if liveTanks provided
-    const liveTanks = loadLiveTanks(); // read on each reload
-    // Skip tanks marked false for controllers and BMMs
-    const needsLiveFilter = (spec.family === "ctrl" || spec.family === "bmm");
-    const filtered = (needsLiveFilter && liveTanks)
-      ? list.filter(d => liveTanks[d.tankId] !== false) // default allow if key missing
+    const live = loadLiveTanks();
+    const filtered = spec.family === "ctrl" && live
+      ? list.filter(d => live[d.tankId] === true)
       : list;
-      if (needsLiveFilter && liveTanks) {
-        const skipped = list.length - filtered.length;
-        if (skipped > 0) {
-         console.log(`🚫 ${spec.family}: skipping ${skipped} tank(s) due to liveTanks.json`);
-  }
-}
 
-
+    if (!filtered.length) {
+      console.warn(`⚠️ Family ${spec.family} has no enabled devices`);
+      continue;
+    }
 
     // Load register map + read blocks for this family
     const mapCtx = loadRegisterMap(spec.mapFile);
@@ -393,6 +423,7 @@ async function pollDevice(mqttClient, family, device) {
       s: values,
       qc: { status: "ok" }
     };
+    updateLiveCache(tankId, fam, ip, payload);
 
     publishTelemetry(mqttClient, payload);
     await logTelemetry(payload);
@@ -428,10 +459,11 @@ async function pollAllFamilies(mqttClient, families) {
   const N = Math.min(CONCURRENCY, work.length);
 
   async function worker() {
-    while (i < work.length) {
+    while (true) {
       const idx = i++;
+      if (idx >= work.length) break;
       const { f, d } = work[idx];
-      // small jitter to avoid Wi-Fi bursts
+      // tiny jitter to avoid Wi-Fi bursts
       if (idx % 3 === 0) await new Promise(r => setTimeout(r, Math.random() * 200));
       await pollDevice(mqttClient, f, d);
     }
@@ -448,44 +480,47 @@ let families = loadFamilies();
 console.log(`👟 Gateway starting: site=${SITE_ID}, interval=${POLL_MS}ms, concurrency=${CONCURRENCY}`);
 console.log(`📦 Families loaded: ${families.map(f => `${f.family}(${f.devices.length})`).join(", ")}`);
 
-apiServer = http.createServer((req, res) => {
-  handleApiRequest(req, res).catch((err) => {
-    console.error("API handler error:", err.message || err);
-    if (!res.writableEnded) {
-      try {
-        sendError(res, 500, "Internal server error");
-      } catch {}
-    }
-  });
-});
+let lastReload = Date.now();
 
-apiServer.listen(API_PORT, API_HOST, () => {
-  console.log(`🌐 HTTP API listening on http://${API_HOST}:${API_PORT}`);
-});
+async function tick() {
+  const now = Date.now();
+  if (now - lastReload >= FAMILY_RELOAD_MS) {
+    lastReload = now;
+    try {
+      families = loadFamilies();
+      console.log(
+        `🔁 Families reloaded: ${families.map(f => `${f.family}(${f.devices.length})`).join(", ")}`
+      );
+    } catch (e) {
+      console.error("Family reload error:", e.message);
+    }
+  }
+
+  await pollAllFamilies(mqttClient, families);
+}
 
 let pollTimer;
 function start() {
-  const run = async () => {
-    try {
-      await pollAllFamilies(mqttClient, families);
-    } catch (e) {
-      console.error("Cycle error:", e);
-    }
-  };
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => {
+    tick().catch((e) => console.error("Poll error:", e.message));
+  }, POLL_MS);
+  tick().catch((e) => console.error("Initial poll error:", e.message));
 
-  // start with slight jitter
-  setTimeout(run, Math.floor(Math.random() * 400));
-  pollTimer = setInterval(run, POLL_MS);
+  apiServer = http.createServer((req, res) => {
+    handleApiRequest(req, res).catch((err) => {
+      console.error("API handler error:", err.message || err);
+      if (!res.writableEnded) {
+        try {
+          sendError(res, 500, "Internal server error");
+        } catch {}
+      }
+    });
+  });
 
-  // periodic config reload (cheap)
-  setInterval(() => {
-    try {
-      families = loadFamilies();
-      console.log(`🔁 Families reloaded: ${families.map(f => `${f.family}(${f.devices.length})`).join(", ")}`);
-    } catch (e) {
-      console.error("Family reload failed:", e.message);
-    }
-  }, FAMILY_RELOAD_MS);
+  apiServer.listen(API_PORT, API_HOST, () => {
+    console.log(`🌐 HTTP API listening on http://${API_HOST}:${API_PORT}`);
+  });
 }
 
 // ---- graceful shutdown ----

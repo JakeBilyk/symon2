@@ -1,0 +1,6 @@
+{"ts_utc":"2025-11-15T00:16:03.807Z","site_id":"dev01","tank_id":"BX01","device_id":"bmm-BX01","qc":"ok","ch_red":48.8,"ch_green":44.7,"ch_blue":40.1,"ch_clear":43,"biomass":3.2}
+{"ts_utc":"2025-11-15T00:16:03.879Z","site_id":"dev01","tank_id":"BD14","device_id":"bmm-BD14","qc":"ok","ch_red":0,"ch_green":0,"ch_blue":0,"ch_clear":0,"biomass":9.3}
+{"ts_utc":"2025-11-15T00:16:03.967Z","site_id":"dev01","tank_id":"BD13","device_id":"bmm-BD13","qc":"ok","ch_red":35.7,"ch_green":31.2,"ch_blue":24.1,"ch_clear":30.2,"biomass":4.5}
+{"ts_utc":"2025-11-15T00:22:03.703Z","site_id":"dev01","tank_id":"BX01","device_id":"bmm-BX01","qc":"ok","ch_red":48.8,"ch_green":44.7,"ch_blue":40.1,"ch_clear":43,"biomass":3.2}
+{"ts_utc":"2025-11-15T00:22:03.755Z","site_id":"dev01","tank_id":"BD14","device_id":"bmm-BD14","qc":"ok","ch_red":0,"ch_green":0,"ch_blue":0,"ch_clear":0,"biomass":9.3}
+{"ts_utc":"2025-11-15T00:22:03.993Z","site_id":"dev01","tank_id":"BD13","device_id":"bmm-BD13","qc":"ok","ch_red":35.7,"ch_green":31.2,"ch_blue":24.1,"ch_clear":30.2,"biomass":4.5}
