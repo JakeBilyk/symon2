@@ -129,6 +129,13 @@
   font-size: 1.2rem;
 }
 
+.pill-group {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .qc-pill {
   padding: 4px 10px;
   border-radius: 999px;
@@ -188,8 +195,30 @@
 .card-meta {
   display: flex;
   justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   font-size: 0.8rem;
   color: #6b7280;
+}
+
+.card-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.card-meta .timestamp {
+  font-variant-numeric: tabular-nums;
+}
+
+.card-meta .timestamp.fresh {
+  color: #15803d;
+}
+
+.card-meta .timestamp.stale {
+  color: #b91c1c;
+  font-weight: 600;
 }
 
 .empty-state {
