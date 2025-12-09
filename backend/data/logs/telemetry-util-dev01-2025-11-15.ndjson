@@ -1,8 +1,0 @@
-{"ts_utc":"2025-11-15T00:16:05.257Z","site_id":"dev01","tank_id":"Blower_A","device_id":"util-Blower_A","qc":"ok"}
-{"ts_utc":"2025-11-15T00:16:05.332Z","site_id":"dev01","tank_id":"Carbofox","device_id":"util-Carbofox","qc":"ok"}
-{"ts_utc":"2025-11-15T00:16:05.361Z","site_id":"dev01","tank_id":"Carbonator","device_id":"util-Carbonator","qc":"ok"}
-{"ts_utc":"2025-11-15T00:16:05.666Z","site_id":"dev01","tank_id":"BrewTank","device_id":"util-BrewTank","qc":"ok"}
-{"ts_utc":"2025-11-15T00:22:04.776Z","site_id":"dev01","tank_id":"Carbofox","device_id":"util-Carbofox","qc":"ok"}
-{"ts_utc":"2025-11-15T00:22:04.817Z","site_id":"dev01","tank_id":"BrewTank","device_id":"util-BrewTank","qc":"ok"}
-{"ts_utc":"2025-11-15T00:22:04.838Z","site_id":"dev01","tank_id":"Carbonator","device_id":"util-Carbonator","qc":"ok"}
-{"ts_utc":"2025-11-15T00:22:04.846Z","site_id":"dev01","tank_id":"Blower_A","device_id":"util-Blower_A","qc":"ok"}
