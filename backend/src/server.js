@@ -1,5 +1,4 @@
 import dotenv from "dotenv";
-dotenv.config();
 
 import fs from "fs";
 import { promises as fsp } from "fs";
@@ -8,6 +7,7 @@ import { fileURLToPath } from "url";
 import http from "http";
 import mqtt from "mqtt";
 
+import { processTelemetryForAlarms } from "./alarmService.js";
 import { loadRegisterMap, getBlocks, decodePointsFromBlocks } from "./registerMap.js";
 import { readBlocksForDevice } from "./modbusBlocks.js";
 import { initLogger, logTelemetry, shutdownLogger, getLogDirectory } from "./loggingService.js";
@@ -18,13 +18,16 @@ const __dirname  = path.dirname(__filename);
 const projectRoot = path.join(__dirname, "..");
 const configDir   = path.join(projectRoot, "config");
 
-const SITE_ID        = process.env.SITE_ID || "dev01";
-const DEVICE_FW      = "gw-1.0.0";
-const POLL_MS        = Number(process.env.POLL_MS || 60_000);     // polling cadence
-const CONCURRENCY    = Number(process.env.POLL_CONCURRENCY || 8); // worker pool size
+// Load env from backend/.env (one level up from src/)
+dotenv.config({ path: path.join(projectRoot, ".env") });
+
+const SITE_ID          = process.env.SITE_ID || "dev01";
+const DEVICE_FW        = "gw-1.0.0";
+const POLL_MS          = Number(process.env.POLL_MS || 60_000);     // polling cadence
+const CONCURRENCY      = Number(process.env.POLL_CONCURRENCY || 8); // worker pool size
 const FAMILY_RELOAD_MS = Number(process.env.FAMILY_RELOAD_MS || 5 * 60_000);
-const API_PORT       = Number(process.env.API_PORT || 4000);
-const API_HOST       = process.env.API_HOST || "0.0.0.0";
+const API_PORT         = Number(process.env.API_PORT || 4000);
+const API_HOST         = process.env.API_HOST || "0.0.0.0";
 
 // ---- live snapshot cache for /api/live ----
 // Structure: liveCache[tankId] = { family, ip, ts_utc, qc, ...decodedValues }
@@ -427,6 +430,7 @@ async function pollDevice(mqttClient, family, device) {
 
     publishTelemetry(mqttClient, payload);
     await logTelemetry(payload);
+    processTelemetryForAlarms(payload, fam);
 
     // Friendly per-family log
     if (fam === "ctrl" || fam === "util") {
@@ -437,8 +441,7 @@ async function pollDevice(mqttClient, family, device) {
       console.log(`✅ ${fam}:${tankId} @ ${ip}`);
     }
   } catch (e) {
-    // Publish fail frame so downstream can detect staleness
-    publishTelemetry(mqttClient, {
+    const failPayload = {
       ts_utc: new Date().toISOString(),
       site_id: SITE_ID,
       tank_id: tankId,
@@ -446,10 +449,18 @@ async function pollDevice(mqttClient, family, device) {
       fw: DEVICE_FW,
       s: {},
       qc: { status: "fail", error: e.message }
-    });
+    };
+
+    // Publish fail frame so downstream can detect staleness
+    publishTelemetry(mqttClient, failPayload);
+
+    // NEW: fire QC fail alarms
+    processTelemetryForAlarms(failPayload, family.family, { error: e });
+
     console.error(`❌ ${family.family}:${tankId} @ ${ip}: ${e.message}`);
   }
 }
+
 
 async function pollAllFamilies(mqttClient, families) {
   const work = families.flatMap(f => f.devices.map(d => ({ f, d })));

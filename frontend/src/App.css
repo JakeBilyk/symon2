@@ -285,6 +285,27 @@ button.primary:not(:disabled):hover {
   box-shadow: 0 14px 30px rgba(219, 15, 64, 0.35);
 }
 
+/* Secondary button style (for modal cancel, etc.) */
+button.secondary {
+  background: #e5e7eb;
+  color: #111827;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  padding: 8px 18px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+button.secondary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+button.secondary:not(:disabled):hover {
+  background: #d1d5db;
+}
+
 .history-form {
   display: grid;
   gap: 16px;
@@ -337,6 +358,107 @@ button.primary:not(:disabled):hover {
   box-shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
 }
 
+/* ---------- NEW: denser grid + compact cards for many tanks ---------- */
+
+.cards-grid-dense {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.card-compact {
+  padding: 12px 12px 10px;
+  border-radius: 14px;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+}
+
+/* ---------- NEW: relay control row + small buttons ---------- */
+
+.relay-controls {
+  margin-top: 4px;
+  margin-bottom: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.relay-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+}
+
+.relay-label {
+  font-weight: 500;
+  color: #4b5563;
+  min-width: 64px;
+}
+
+/* Small neutral buttons for ON/OFF, still using your palette */
+.btn-small {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #f9fafb;
+  color: #111827;
+  cursor: pointer;
+  transition: background 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+}
+
+.btn-small:hover:not(:disabled) {
+  background: #e5e7eb;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.15);
+  transform: translateY(-0.5px);
+}
+
+.btn-small:disabled {
+  opacity: 0.6;
+  cursor: default;
+  box-shadow: none;
+}
+
+/* ---------- NEW: modal for confirm dialogs ---------- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal {
+  background: var(--surface);
+  border-radius: 16px;
+  padding: 18px 20px;
+  max-width: 380px;
+  width: 100%;
+  border: 1px solid var(--border);
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.35);
+}
+
+.modal-title {
+  margin: 0 0 6px;
+  font-size: 1.1rem;
+  color: #111827;
+}
+
+.modal-body {
+  margin: 0 0 14px;
+  font-size: 0.9rem;
+  color: #4b5563;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 @media (max-width: 720px) {
   .top-bar {
     flex-direction: column;
@@ -346,5 +468,9 @@ button.primary:not(:disabled):hover {
 
   .app-main {
     padding: 24px 20px;
+  }
+
+  .modal {
+    margin: 0 16px;
   }
 }

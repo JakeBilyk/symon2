@@ -13,7 +13,6 @@
   "C15": true,
   "C16": true,
   "C17": false,
-
   "D01": true,
   "D02": true,
   "D03": true,
@@ -21,7 +20,6 @@
   "D05": true,
   "D06": true,
   "D07": true,
-
   "D09": true,
   "D10": true,
   "D11": false,
@@ -40,13 +38,10 @@
   "D24": false,
   "D25": false,
   "D26": false,
-
   "I01": true,
   "I02": true,
   "I03": true,
-  
   "M01": true,
-
   "P01": true,
   "P02": true,
   "P03": true,
@@ -59,21 +54,14 @@
   "P10": true,
   "P11": true,
   "P12": true,
-
-
   "R01": true,
   "R02": true,
   "R03": true,
   "R04": true,
   "R05": true,
   "R06": true,
-
   "X01": true,
   "X02": true,
   "X03": true,
-  "X04": true,
-
-  "BD13": true,
-  "BD14": true,
-  "BX01": true
+  "X04": true
 }

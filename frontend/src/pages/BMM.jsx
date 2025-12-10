@@ -1,109 +1,137 @@
 import React, { useEffect, useMemo, useState } from "react";
-import mqtt from "mqtt";
+import { fetchJson } from "../utils/api.js";
 
-const TOPIC = "symbrosia/+/+/+/telemetry";
+const REFRESH_INTERVAL_MS = 30_000;
+const STALE_THRESHOLD_MS = 15 * 60 * 1000;
 
 export default function BmmDashboard() {
-  const [telemetry, setTelemetry] = useState({});
-  const [connected, setConnected] = useState(false);
-
-  const url = import.meta.env.VITE_MQTT_URL;
-  const user = import.meta.env.VITE_MQTT_USER;
-  const pass = import.meta.env.VITE_MQTT_PASS;
-
-  const client = useMemo(() => {
-    if (!url) return null;
-    return mqtt.connect(url, {
-      username: user || undefined,
-      password: pass || undefined,
-      keepalive: 30,
-      reconnectPeriod: 2000,
-    });
-  }, [url, user, pass]);
+  const [snapshots, setSnapshots] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!client) return undefined;
+    let cancelled = false;
+    let timer;
 
-    const handleConnect = () => {
-      setConnected(true);
-      client.subscribe(TOPIC, (err) => {
-        if (err) console.error("BMM subscribe error", err.message);
-      });
-    };
-    const handleReconnect = () => setConnected(false);
-    const handleClose = () => setConnected(false);
-    const handleError = (err) => console.error("MQTT error:", err.message);
-    const handleMessage = (topic, buf) => {
+    async function load(isInitial = false) {
+      if (isInitial) setLoading(true);
       try {
-        const payload = JSON.parse(buf.toString());
-        if (!payload?.tank_id) return;
-        const parts = topic.split("/");
-        const device = parts[3];
-        if (!device || !device.startsWith("bmm-")) return;
-        setTelemetry((prev) => ({ ...prev, [payload.tank_id]: payload }));
+        const liveData = await fetchJson("/api/live");
+        if (cancelled) return;
+        const payload =
+          liveData && typeof liveData === "object" && !Array.isArray(liveData)
+            ? liveData
+            : {};
+        setSnapshots(payload);
+        setError("");
       } catch (e) {
-        console.error("BMM telemetry parse error:", e.message);
+        if (cancelled) return;
+        setError(e?.message || "Failed to load BMM snapshots");
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-    };
+    }
 
-    client.on("connect", handleConnect);
-    client.on("reconnect", handleReconnect);
-    client.on("close", handleClose);
-    client.on("error", handleError);
-    client.on("message", handleMessage);
+    load(true);
+    timer = setInterval(() => load(false), REFRESH_INTERVAL_MS);
 
     return () => {
-      client.removeListener("connect", handleConnect);
-      client.removeListener("reconnect", handleReconnect);
-      client.removeListener("close", handleClose);
-      client.removeListener("error", handleError);
-      client.removeListener("message", handleMessage);
-      client.end(true);
+      cancelled = true;
+      if (timer) clearInterval(timer);
     };
-  }, [client]);
+  }, []);
 
-  const cards = useMemo(
-    () => Object.entries(telemetry).sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true })),
-    [telemetry],
-  );
+  const cards = useMemo(() => {
+    const entries = Object.entries(snapshots || {});
+
+    const bmmEntries = entries.filter(([, snapshot]) => {
+      return snapshot?.family === "bmm";
+    });
+
+    bmmEntries.sort(([a], [b]) =>
+      a.localeCompare(b, undefined, { numeric: true })
+    );
+    return bmmEntries;
+  }, [snapshots]);
 
   return (
     <section className="page">
       <header className="page-header">
         <div>
           <h1>BMMs</h1>
-          <p className="page-subtitle">Biomass monitor snapshots with live MQTT telemetry.</p>
-        </div>
-        <div className="connection-status">
-          <span className={`status-dot ${connected ? "connected" : "disconnected"}`} />
-          <span>{connected ? "MQTT connected" : "MQTT disconnected"}</span>
+          <p className="page-subtitle">
+            Live cached snapshots from biomass monitors.
+          </p>
         </div>
       </header>
 
-      {cards.length > 0 ? (
-        <div className="cards-grid">
-          {cards.map(([tankId, payload]) => (
-            <article key={tankId} className="card">
-              <header className="card-header">
-                <h3>{tankId}</h3>
-              </header>
+      {error && <div className="callout error">{error}</div>}
 
-              <dl className="metric-list">
-                <Metric label="Biomass" value={formatNumber(payload?.biomass, 2)} />
-                <Metric label="Ch Clear" value={formatNumber(payload?.ch_clear, 1)} />
-                <Metric label="Signal" value={formatNumber(payload?.signal_strength, 1)} />
-              </dl>
+      {loading ? (
+        <div className="empty-state">
+          <p>Loading BMM telemetry…</p>
+        </div>
+      ) : cards.length > 0 ? (
+        <div className="cards-grid cards-grid-dense">
+          {cards.map(([tankId, snapshot]) => {
+            const biomass = snapshot?.biomass;
+            const chClear = snapshot?.ch_clear;
+            const signal = snapshot?.signal_strength;
+            const updatedIso = snapshot?.ts_utc;
+            const qcLabel =
+              typeof snapshot?.qc === "string"
+                ? snapshot.qc.toUpperCase()
+                : "—";
+            const qcClass =
+              snapshot?.qc === "ok"
+                ? "ok"
+                : snapshot?.qc === "fail"
+                ? "fail"
+                : "";
+            const stale = isSnapshotStale(updatedIso);
+            const timestampClasses = ["timestamp", stale ? "stale" : "fresh"];
 
-              <footer className="card-meta">
-                <span>{payload?.device_id ?? "—"}</span>
-                <span>{payload?.ts_utc ? new Date(payload.ts_utc).toLocaleTimeString() : "—"}</span>
-              </footer>
-            </article>
-          ))}
+            return (
+              <article key={tankId} className="card card-compact">
+                <header className="card-header">
+                  <h3>{tankId}</h3>
+                  <div className="pill-group">
+                    <span
+                      className={["qc-pill", qcClass]
+                        .filter(Boolean)
+                        .join(" ")}
+                    >
+                      {qcLabel}
+                    </span>
+                    {stale && <span className="qc-pill fail">STALE</span>}
+                  </div>
+                </header>
+
+                <dl className="metric-list">
+                  <Metric label="Biomass" value={formatNumber(biomass, 2)} />
+                  <Metric label="Ch Clear" value={formatNumber(chClear, 2)} />
+                  <Metric
+                    label="Signal"
+                    value={formatNumber(signal, 1) ?? "—"}
+                  />
+                </dl>
+
+                <footer className="card-meta">
+                  <span title="Device IP">{snapshot?.ip || "—"}</span>
+                  <span
+                    className={timestampClasses.join(" ")}
+                    title={formatExactTimestamp(updatedIso)}
+                  >
+                    {formatUpdatedAgo(updatedIso)}
+                  </span>
+                </footer>
+              </article>
+            );
+          })}
         </div>
       ) : (
         <div className="empty-state">
-          <p>Waiting for BMM telemetry…</p>
+          <p>No BMM telemetry has been recorded yet.</p>
         </div>
       )}
     </section>
@@ -114,11 +142,41 @@ function Metric({ label, value }) {
   return (
     <div className="metric-row">
       <dt>{label}</dt>
-      <dd>{value ?? "—"}</dd>
+      <dd className="metric-value">{value ?? "—"}</dd>
     </div>
   );
 }
 
 function formatNumber(value, digits = 1) {
-  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : null;
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toFixed(digits)
+    : null;
+}
+
+function isSnapshotStale(isoString) {
+  const ts = Date.parse(isoString || "");
+  if (!Number.isFinite(ts)) return true;
+  return Date.now() - ts > STALE_THRESHOLD_MS;
+}
+
+function formatUpdatedAgo(isoString) {
+  const ts = Date.parse(isoString || "");
+  if (!Number.isFinite(ts)) return "—";
+
+  const diffMs = Date.now() - ts;
+  if (diffMs < 0) return "just now";
+  const diffMinutes = Math.round(diffMs / 60000);
+  if (diffMinutes < 1) return "just now";
+  if (diffMinutes < 60) return `${diffMinutes}m ago`;
+
+  const diffHours = Math.round(diffMinutes / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+
+  return new Date(ts).toLocaleString();
+}
+
+function formatExactTimestamp(isoString) {
+  const ts = Date.parse(isoString || "");
+  if (!Number.isFinite(ts)) return "No recent data";
+  return new Date(ts).toLocaleString();
 }
