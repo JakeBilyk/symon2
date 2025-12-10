@@ -1,2 +1,2 @@
 backend/data/logs
-backend/.env
+*.env
