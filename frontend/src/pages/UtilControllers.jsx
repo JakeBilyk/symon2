@@ -109,13 +109,9 @@ export default function UtilControllers() {
                 <header className="card-header">
                   <h3>{tankId}</h3>
                   <div className="pill-group">
-                    <span
-                      className={["qc-pill", qcClass]
-                        .filter(Boolean)
-                        .join(" ")}
-                    >
-                      {qcLabel}
-                    </span>
+                    {qcClass === "fail" && (
+                      <span className="qc-pill fail">FAIL</span>
+                    )}
                     {stale && <span className="qc-pill fail">STALE</span>}
                   </div>
                 </header>

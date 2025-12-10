@@ -13,9 +13,10 @@ dotenv.config({ path: path.join(__dirname, "..", ".env") });
 import https from "https";
 import { URL } from "url";
 
+// Slack Incoming Webhook URL from env
 const WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || "";
 
-// Basic rule definitions – tweak thresholds as needed.
+// Alarm rule definitions
 const ALARM_RULES = [
   {
     id: "ctrl_ph_out_of_range",
@@ -25,7 +26,7 @@ const ALARM_RULES = [
     low: 7.2,
     high: 8.2,
     severity: "warning",
-    description: "pH out of target range 7.2–8.2",
+    description: "pH",
   },
   {
     id: "ctrl_temp_out_of_range",
@@ -33,26 +34,32 @@ const ALARM_RULES = [
     type: "metric_threshold",
     metric: "temp1_C",
     low: 18,
-    high: 30,
+    high: 27.5,
     severity: "warning",
-    description: "Temperature out of target range 18–30 °C",
+    description: "Temp",
   },
   {
     id: "qc_fail",
     family: null, // all families
     type: "qc_fail",
     severity: "error",
-    description: "Polling / device quality check failed",
+    description: "Connection",
   },
 ];
 
-// In-memory state so we don't spam Slack each poll.
+// In-memory state so we don't spam Slack every poll.
 // Key: `${ruleId}|${tankId}`
 const alarmState = new Map();
 
+// Events waiting to be batched into the next Slack message
+const pendingEvents = [];
+
 /**
  * Entry point: call this for every telemetry payload.
- * @param {object} payload  telemetry frame (same as publishTelemetry)
+ * We just compute rule state changes and stash events; we
+ * don't talk to Slack directly here anymore.
+ *
+ * @param {object} payload  telemetry frame
  * @param {string} family   "ctrl" | "util" | "bmm"
  * @param {object} [opts]   { error?: Error }
  */
@@ -80,11 +87,14 @@ export function processTelemetryForAlarms(payload, family, opts = {}) {
       if (typeof value !== "number" || !Number.isFinite(value)) {
         continue;
       }
+
       const tooLow =
         typeof rule.low === "number" && value < rule.low;
       const tooHigh =
         typeof rule.high === "number" && value > rule.high;
+
       active = tooLow || tooHigh;
+
       if (active) {
         const dir = tooLow ? "LOW" : "HIGH";
         details = `${rule.metric}=${value.toFixed(2)} (${dir}) thresholds [${rule.low}, ${rule.high}]`;
@@ -92,58 +102,135 @@ export function processTelemetryForAlarms(payload, family, opts = {}) {
     } else if (rule.type === "qc_fail") {
       active = qcStatus === "fail";
       if (active) {
-        const err = payload?.qc?.error || opts.error?.message || "Unknown error";
-        details = `qc.status=fail ${err}`;
+        const err =
+          payload?.qc?.error || opts.error?.message || "Unknown error";
+        details = `QC fail: ${err}`;
       }
     }
 
-    updateRuleState(rule, tankId, family, payload, active, details, now);
+    const evt = updateRuleState(
+      rule,
+      tankId,
+      family,
+      payload,
+      active,
+      details,
+      now,
+    );
+    if (evt) {
+      pendingEvents.push(evt);
+    }
   }
 }
 
 /**
- * Decide whether to send trigger / resolve messages.
+ * Flush all pending alarm events into a single batched Slack message.
+ * Call this once per polling period (after pollAllFamilies).
  */
-function updateRuleState(rule, tankId, family, payload, active, details, now) {
+export async function flushAlarmBatch() {
+  if (!WEBHOOK_URL) return;
+  if (pendingEvents.length === 0) return;
+
+  // Group events by tank/family for nicer formatting
+  const byTank = new Map();
+  for (const evt of pendingEvents) {
+    const key = `${evt.family}|${evt.tankId}`;
+    if (!byTank.has(key)) {
+      byTank.set(key, []);
+    }
+    byTank.get(key).push(evt);
+  }
+
+  const tankBlocks = [];
+
+  for (const [, events] of byTank.entries()) {
+    const { tankId, family } = events[0];
+
+    const alarms = events.filter((e) => e.kind === "ALARM");
+    const resolves = events.filter((e) => e.kind === "RESOLVED");
+
+    if (alarms.length === 0 && resolves.length === 0) continue;
+
+    const lines = [];
+    lines.push(`*Tank:* \`${tankId}\` (${family})`);
+
+    if (alarms.length > 0) {
+      const sevSet = new Set(
+        alarms.map((e) => (e.rule.severity || "info").toUpperCase()),
+      );
+      const sevLabel = sevSet.size === 1 ? [...sevSet][0] : "MIXED";
+
+      for (const e of alarms) {
+        const label = e.rule.description || e.rule.id;
+        lines.push(
+          `• ${label}` + (e.details ? ` — ${e.details}` : ""),
+        );
+      }
+    }
+
+    if (resolves.length > 0) {
+      if (alarms.length > 0) lines.push(""); // blank line between sections
+      lines.push(`:white_check_mark: *RESOLVED*`);
+      for (const e of resolves) {
+        const label = e.rule.description || e.rule.id;
+        lines.push(
+          `• ${label}` +
+            (e.details ? ` — last condition: ${e.details}` : ""),
+        );
+      }
+    }
+
+    tankBlocks.push(lines.join("\n"));
+  }
+
+  // Build one big Slack message for all tanks in this poll
+  if (tankBlocks.length === 0) {
+    pendingEvents.length = 0;
+    return;
+  }
+
+  const text = tankBlocks.join("\n\n");
+
+  try {
+    await postToSlack(text);
+  } catch (e) {
+    console.error("Slack alarm batch send failed:", e.message);
+  } finally {
+    pendingEvents.length = 0; // clear batch either way
+  }
+}
+
+/**
+ * Track rule state; return an event object when it changes.
+ */
+function updateRuleState(
+  rule,
+  tankId,
+  family,
+  payload,
+  active,
+  details,
+  now,
+) {
   const key = `${rule.id}|${tankId}`;
   const prev = alarmState.get(key) || { active: false, lastChange: 0 };
+
+  // No state change → no event
   if (active === prev.active) {
-    return;
+    return null;
   }
 
   alarmState.set(key, { active, lastChange: now });
 
-  const site = payload?.site_id || "unknown-site";
-  const device = payload?.device_id || `${family}-${tankId}`;
-  const when = payload?.ts_utc || new Date().toISOString();
-
-  if (active) {
-    const text =
-      `:rotating_light: *ALARM* (${rule.severity.toUpperCase()})\n` +
-      `*${rule.description}*\n` +
-      `• Site: \`${site}\`\n` +
-      `• Tank: \`${tankId}\` (${family})\n` +
-      `• Device: \`${device}\`\n` +
-      (details ? `• Details: ${details}\n` : "") +
-      `• At: ${when}`;
-
-    postToSlack(text).catch((e) => {
-      console.error("Slack alarm send failed:", e.message);
-    });
-  } else {
-    const text =
-      `:white_check_mark: *RESOLVED*\n` +
-      `*${rule.description}*\n` +
-      `• Site: \`${site}\`\n` +
-      `• Tank: \`${tankId}\` (${family})\n` +
-      `• Device: \`${device}\`\n` +
-      (details ? `• Last condition: ${details}\n` : "") +
-      `• Cleared at: ${new Date().toISOString()}`;
-
-    postToSlack(text).catch((e) => {
-      console.error("Slack resolve send failed:", e.message);
-    });
-  }
+  return {
+    kind: active ? "ALARM" : "RESOLVED",
+    rule,
+    tankId,
+    family,
+    details,
+    payload,
+    ts: now,
+  };
 }
 
 /**
@@ -170,14 +257,13 @@ function postToSlack(text) {
         },
       },
       (res) => {
-        // Drain response
         res.on("data", () => {});
         res.on("end", () => {
           if (res.statusCode >= 200 && res.statusCode < 300) {
             resolve();
           } else {
             reject(
-              new Error(`Slack webhook HTTP ${res.statusCode || "?"}`)
+              new Error(`Slack webhook HTTP ${res.statusCode || "?"}`),
             );
           }
         });

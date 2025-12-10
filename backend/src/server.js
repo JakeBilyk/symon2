@@ -7,7 +7,7 @@ import { fileURLToPath } from "url";
 import http from "http";
 import mqtt from "mqtt";
 
-import { processTelemetryForAlarms } from "./alarmService.js";
+import { processTelemetryForAlarms, flushAlarmBatch } from "./alarmService.js";
 import { loadRegisterMap, getBlocks, decodePointsFromBlocks } from "./registerMap.js";
 import { readBlocksForDevice } from "./modbusBlocks.js";
 import { initLogger, logTelemetry, shutdownLogger, getLogDirectory } from "./loggingService.js";
@@ -500,7 +500,9 @@ async function tick() {
     try {
       families = loadFamilies();
       console.log(
-        `🔁 Families reloaded: ${families.map(f => `${f.family}(${f.devices.length})`).join(", ")}`
+        `🔁 Families reloaded: ${families
+          .map((f) => `${f.family}(${f.devices.length})`)
+          .join(", ")}`,
       );
     } catch (e) {
       console.error("Family reload error:", e.message);
@@ -508,7 +510,9 @@ async function tick() {
   }
 
   await pollAllFamilies(mqttClient, families);
+  await flushAlarmBatch(); // 👈 new line: one Slack message per poll
 }
+
 
 let pollTimer;
 function start() {
