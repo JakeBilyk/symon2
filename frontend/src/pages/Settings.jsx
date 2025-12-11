@@ -1,5 +1,5 @@
-// src/pages/Settings.jsx
-import React, { useEffect, useState, useMemo } from "react";
+// frontend/src/pages/Settings.jsx
+import React, { useEffect, useMemo, useState } from "react";
 import { fetchJson } from "../utils/api.js";
 
 export default function Settings() {
@@ -7,13 +7,14 @@ export default function Settings() {
   const [phHigh, setPhHigh] = useState("");
   const [tempLow, setTempLow] = useState("");
   const [tempHigh, setTempHigh] = useState("");
+  const [qcEnabled, setQcEnabled] = useState(true);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
-  // Load current thresholds from backend
+  // Load current settings
   useEffect(() => {
     let cancelled = false;
 
@@ -24,19 +25,24 @@ export default function Settings() {
 
       try {
         const data = await fetchJson("/api/alarm-thresholds");
-        // Expecting shape: { ph: { low, high }, temp: { low, high } }
         const ph = data?.ph || {};
         const temp = data?.temp || {};
+        const conn = data?.connectivity || {};
 
         if (!cancelled) {
           setPhLow(ph.low != null ? String(ph.low) : "");
           setPhHigh(ph.high != null ? String(ph.high) : "");
           setTempLow(temp.low != null ? String(temp.low) : "");
           setTempHigh(temp.high != null ? String(temp.high) : "");
+          setQcEnabled(
+            typeof conn.qcAlarmsEnabled === "boolean"
+              ? conn.qcAlarmsEnabled
+              : true,
+          );
         }
       } catch (e) {
         if (!cancelled) {
-          setError(e?.message || "Failed to load alarm thresholds");
+          setError(e?.message || "Failed to load alarm settings");
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -44,24 +50,21 @@ export default function Settings() {
     }
 
     load();
-
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // Parse values + basic validation
   const { parsed, isValid, validationMessage } = useMemo(() => {
-    const result = {
+    const res = {
       phLowNum: parseFloat(phLow),
       phHighNum: parseFloat(phHigh),
       tempLowNum: parseFloat(tempLow),
       tempHighNum: parseFloat(tempHigh),
     };
 
-    // All must be finite numbers
-    for (const key of Object.keys(result)) {
-      if (!Number.isFinite(result[key])) {
+    for (const key of Object.keys(res)) {
+      if (!Number.isFinite(res[key])) {
         return {
           parsed: null,
           isValid: false,
@@ -70,28 +73,25 @@ export default function Settings() {
       }
     }
 
-    if (result.phLowNum >= result.phHighNum) {
+    if (res.phLowNum >= res.phHighNum) {
       return {
-        parsed: result,
+        parsed: res,
         isValid: false,
-        validationMessage: "pH low threshold must be less than pH high threshold.",
+        validationMessage:
+          "pH low threshold must be less than pH high threshold.",
       };
     }
 
-    if (result.tempLowNum >= result.tempHighNum) {
+    if (res.tempLowNum >= res.tempHighNum) {
       return {
-        parsed: result,
+        parsed: res,
         isValid: false,
         validationMessage:
           "Temperature low threshold must be less than temperature high threshold.",
       };
     }
 
-    return {
-      parsed: result,
-      isValid: true,
-      validationMessage: "",
-    };
+    return { parsed: res, isValid: true, validationMessage: "" };
   }, [phLow, phHigh, tempLow, tempHigh]);
 
   async function handleSubmit(e) {
@@ -114,12 +114,15 @@ export default function Settings() {
             low: parsed.tempLowNum,
             high: parsed.tempHighNum,
           },
+          connectivity: {
+            qcAlarmsEnabled: qcEnabled,
+          },
         }),
       });
 
-      setSuccess("Alarm thresholds saved.");
+      setSuccess("Alarm settings saved.");
     } catch (e) {
-      setError(e?.message || "Failed to save alarm thresholds");
+      setError(e?.message || "Failed to save alarm settings");
     } finally {
       setSaving(false);
     }
@@ -131,8 +134,8 @@ export default function Settings() {
         <div>
           <h1>Alarm Settings</h1>
           <p className="page-subtitle">
-            Adjust pH and temperature thresholds used for controller alarms. Changes
-            take effect on the next polling cycles.
+            Adjust pH and temperature thresholds used for controller alarms, and
+            toggle connection (QC) alarms on or off.
           </p>
         </div>
       </header>
@@ -187,6 +190,18 @@ export default function Settings() {
               value={tempHigh}
               onChange={(e) => setTempHigh(e.target.value)}
             />
+          </label>
+
+          <label>
+            <span>Connection / QC alarms</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <input
+                type="checkbox"
+                checked={qcEnabled}
+                onChange={(e) => setQcEnabled(e.target.checked)}
+              />
+              <span>{qcEnabled ? "On (notify when offline)" : "Off"}</span>
+            </div>
           </label>
 
           <button

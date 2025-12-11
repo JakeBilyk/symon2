@@ -1,48 +1,46 @@
-// alarmService.js
+// backend/src/alarmService.js
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
 import { promises as fsp } from "fs";
-
 import https from "https";
 import { URL } from "url";
 
-// --- resolve correct .env path ---
+// --- resolve .env path ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Load backend/.env (one directory up from src/)
 dotenv.config({ path: path.join(__dirname, "..", ".env") });
 
-// Slack Incoming Webhook URL from env
 const WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || "";
 
-// Where we persist alarm thresholds so they survive reboots
-// e.g. backend/data/alarm-thresholds.json
-const THRESHOLDS_PATH = path.join(
-  __dirname,
-  "..",
-  "data",
-  "alarm-thresholds.json",
+// How long a tank can go without a successful poll before we alarm (in minutes)
+const CONNECTIVITY_ALARM_MINUTES = Number(
+  process.env.CONNECTIVITY_ALARM_MINUTES || 60,
 );
+const CONNECTIVITY_ALARM_MS = CONNECTIVITY_ALARM_MINUTES * 60_000;
 
-// Default thresholds (what you have today)
-const DEFAULT_THRESHOLDS = {
+// Where alarm settings are persisted
+const SETTINGS_PATH = path.join(__dirname, "..", "data", "alarm-settings.json");
+
+// Default config
+const DEFAULT_CONFIG = {
   ph: { low: 7.2, high: 8.2 },
   temp: { low: 18, high: 27.5 },
+  connectivity: {
+    qcAlarmsEnabled: true,
+  },
 };
 
-// Alarm rule definitions – low/high values will be kept in sync with
-// the current thresholds at startup and whenever they are changed.
+// Alarm rules; ph/temp thresholds will be kept in sync with config
 const ALARM_RULES = [
   {
     id: "ctrl_ph_out_of_range",
     family: "ctrl",
     type: "metric_threshold",
     metric: "ph",
-    low: DEFAULT_THRESHOLDS.ph.low,
-    high: DEFAULT_THRESHOLDS.ph.high,
+    low: DEFAULT_CONFIG.ph.low,
+    high: DEFAULT_CONFIG.ph.high,
     severity: "warning",
     description: "pH",
   },
@@ -51,45 +49,41 @@ const ALARM_RULES = [
     family: "ctrl",
     type: "metric_threshold",
     metric: "temp1_C",
-    low: DEFAULT_THRESHOLDS.temp.low,
-    high: DEFAULT_THRESHOLDS.temp.high,
+    low: DEFAULT_CONFIG.temp.low,
+    high: DEFAULT_CONFIG.temp.high,
     severity: "warning",
     description: "Temp",
   },
   {
     id: "qc_fail",
-    family: null, // all families
+    family: null,
     type: "qc_fail",
     severity: "error",
     description: "Connection",
   },
 ];
 
-// In-memory state so we don't spam Slack every poll.
-// Key: `${ruleId}|${tankId}`
+// Per-tank connectivity state for offline duration
+// key: tankId -> { lastOk: number | null, firstFail: number | null, consecutiveFails: number }
+const connectivityState = new Map();
+
+// Alarm state so we don't spam Slack
+// key: `${ruleId}|${tankId}`
 const alarmState = new Map();
 
-// Events waiting to be batched into the next Slack message
+// Events waiting for batch send
 const pendingEvents = [];
 
-// Current thresholds (initialized from disk or defaults)
-let currentThresholds = loadThresholdsFromDisk();
-applyThresholdsToRules(currentThresholds);
+// Current config in memory
+let currentConfig = loadConfigFromDisk();
+applyConfigToRules(currentConfig);
 
-/**
- * Entry point: call this for every telemetry payload.
- * We just compute rule state changes and stash events; we
- * don't talk to Slack directly here anymore.
- *
- * @param {object} payload  telemetry frame
- * @param {string} family   "ctrl" | "util" | "bmm"
- * @param {object} [opts]   { error?: Error }
- */
+/* ------------------------------------------------------------------ */
+/*                 Main entry: process telemetry frame                 */
+/* ------------------------------------------------------------------ */
+
 export function processTelemetryForAlarms(payload, family, opts = {}) {
-  if (!WEBHOOK_URL) {
-    // Alarms disabled if no webhook configured
-    return;
-  }
+  if (!WEBHOOK_URL) return;
 
   const tankId = payload?.tank_id;
   if (!tankId) return;
@@ -97,6 +91,25 @@ export function processTelemetryForAlarms(payload, family, opts = {}) {
   const qcStatus = payload?.qc?.status || "ok";
   const s = payload?.s || {};
   const now = Date.now();
+
+  // --- update per-tank connectivity state ---
+  let conn = connectivityState.get(tankId);
+  if (!conn) {
+    conn = { lastOk: null, firstFail: null, consecutiveFails: 0 };
+  }
+
+  if (qcStatus === "ok") {
+    conn.lastOk = now;
+    conn.firstFail = null;
+    conn.consecutiveFails = 0;
+  } else if (qcStatus === "fail") {
+    conn.consecutiveFails += 1;
+    if (!conn.firstFail) {
+      conn.firstFail = now;
+    }
+  }
+  connectivityState.set(tankId, conn);
+  // ------------------------------------------
 
   for (const rule of ALARM_RULES) {
     if (rule.family && rule.family !== family) continue;
@@ -106,13 +119,10 @@ export function processTelemetryForAlarms(payload, family, opts = {}) {
 
     if (rule.type === "metric_threshold") {
       const value = s[rule.metric];
-      if (typeof value !== "number" || !Number.isFinite(value)) {
-        continue;
-      }
+      if (typeof value !== "number" || !Number.isFinite(value)) continue;
 
       const tooLow = typeof rule.low === "number" && value < rule.low;
       const tooHigh = typeof rule.high === "number" && value > rule.high;
-
       active = tooLow || tooHigh;
 
       if (active) {
@@ -122,11 +132,36 @@ export function processTelemetryForAlarms(payload, family, opts = {}) {
         )} (${dir}) thresholds [${rule.low}, ${rule.high}]`;
       }
     } else if (rule.type === "qc_fail") {
-      active = qcStatus === "fail";
-      if (active) {
-        const err =
-          payload?.qc?.error || opts.error?.message || "Unknown error";
-        details = `QC fail: ${err}`;
+      // NEW: allow techs to disable QC / connection alarms entirely
+      if (!currentConfig.connectivity.qcAlarmsEnabled) {
+        continue; // skip state updates and events for this rule
+      }
+
+      const err =
+        payload?.qc?.error || opts.error?.message || "Unknown error";
+
+      if (qcStatus === "fail") {
+        // How long since last successful poll?
+        let offlineMs = 0;
+        if (conn.lastOk) {
+          offlineMs = now - conn.lastOk;
+        } else if (conn.firstFail) {
+          offlineMs = now - conn.firstFail;
+        }
+
+        const offlineMinutes = offlineMs / 60000;
+        const overThreshold = offlineMs >= CONNECTIVITY_ALARM_MS;
+
+        active = overThreshold;
+
+        if (active) {
+          details = `No successful poll for ~${offlineMinutes.toFixed(
+            0,
+          )} min; last error: ${err}`;
+        }
+      } else {
+        // qcStatus === "ok" → clear any existing connectivity alarm
+        active = false;
       }
     }
 
@@ -145,21 +180,18 @@ export function processTelemetryForAlarms(payload, family, opts = {}) {
   }
 }
 
-/**
- * Flush all pending alarm events into a single batched Slack message.
- * Call this once per polling period (after pollAllFamilies).
- */
+/* ------------------------------------------------------------------ */
+/*                   Batch + send to Slack (unchanged)                */
+/* ------------------------------------------------------------------ */
+
 export async function flushAlarmBatch() {
   if (!WEBHOOK_URL) return;
   if (pendingEvents.length === 0) return;
 
-  // Group events by tank/family for nicer formatting
   const byTank = new Map();
   for (const evt of pendingEvents) {
     const key = `${evt.family}|${evt.tankId}`;
-    if (!byTank.has(key)) {
-      byTank.set(key, []);
-    }
+    if (!byTank.has(key)) byTank.set(key, []);
     byTank.get(key).push(evt);
   }
 
@@ -167,7 +199,6 @@ export async function flushAlarmBatch() {
 
   for (const [, events] of byTank.entries()) {
     const { tankId, family } = events[0];
-
     const alarms = events.filter((e) => e.kind === "ALARM");
     const resolves = events.filter((e) => e.kind === "RESOLVED");
 
@@ -177,13 +208,6 @@ export async function flushAlarmBatch() {
     lines.push(`*Tank:* \`${tankId}\` (${family})`);
 
     if (alarms.length > 0) {
-      const sevSet = new Set(
-        alarms.map((e) => (e.rule.severity || "info").toUpperCase()),
-      );
-      const sevLabel = sevSet.size === 1 ? [...sevSet][0] : "MIXED";
-
-      // sevLabel is there if you ever want to decorate, but we don't
-      // currently prepend it to each line to keep things clean.
       for (const e of alarms) {
         const label = e.rule.description || e.rule.id;
         lines.push(`• ${label}` + (e.details ? ` — ${e.details}` : ""));
@@ -191,7 +215,7 @@ export async function flushAlarmBatch() {
     }
 
     if (resolves.length > 0) {
-      if (alarms.length > 0) lines.push(""); // blank line between sections
+      if (alarms.length > 0) lines.push("");
       lines.push(`:white_check_mark: *RESOLVED*`);
       for (const e of resolves) {
         const label = e.rule.description || e.rule.id;
@@ -205,7 +229,6 @@ export async function flushAlarmBatch() {
     tankBlocks.push(lines.join("\n"));
   }
 
-  // Build one big Slack message for all tanks in this poll
   if (tankBlocks.length === 0) {
     pendingEvents.length = 0;
     return;
@@ -218,104 +241,77 @@ export async function flushAlarmBatch() {
   } catch (e) {
     console.error("Slack alarm batch send failed:", e.message);
   } finally {
-    pendingEvents.length = 0; // clear batch either way
+    pendingEvents.length = 0;
   }
 }
 
 /* ------------------------------------------------------------------ */
-/*        NEW: getters/setters for thresholds + JSON persistence      */
+/*      NEW: public getters/setters (used by /api + Settings page)    */
 /* ------------------------------------------------------------------ */
 
-/**
- * Read the current thresholds (safe clone so callers can't mutate in place).
- */
 export function getAlarmThresholds() {
+  // shallow clone to avoid external mutation
   return {
-    ph: { ...currentThresholds.ph },
-    temp: { ...currentThresholds.temp },
+    ph: { ...currentConfig.ph },
+    temp: { ...currentConfig.temp },
+    connectivity: { ...currentConfig.connectivity },
   };
 }
 
-/**
- * Update thresholds from the API and persist them to disk.
- * Expects payload like:
- * {
- *   ph:   { low: number, high: number },
- *   temp: { low: number, high: number }
- * }
- */
 export async function setAlarmThresholds(payload) {
-  const next = validateThresholds(payload);
+  const next = normalizeConfig(payload);
 
-  // Update in-memory thresholds
-  currentThresholds = next;
-  applyThresholdsToRules(next);
+  currentConfig = next;
+  applyConfigToRules(next);
 
-  // Persist to disk
   try {
-    await fsp.mkdir(path.dirname(THRESHOLDS_PATH), { recursive: true });
+    await fsp.mkdir(path.dirname(SETTINGS_PATH), { recursive: true });
     await fsp.writeFile(
-      THRESHOLDS_PATH,
+      SETTINGS_PATH,
       JSON.stringify(next, null, 2),
       "utf8",
     );
   } catch (err) {
-    console.error("Failed to persist alarm thresholds:", err.message);
-    // Surface this so the API can return 500 if needed
-    throw new Error("Failed to persist alarm thresholds");
+    console.error("Failed to persist alarm settings:", err.message);
+    throw new Error("Failed to persist alarm settings");
   }
 
   return getAlarmThresholds();
 }
 
 /* ------------------------------------------------------------------ */
-/*                    Internal helpers & utilities                     */
+/*                        Internal helpers                             */
 /* ------------------------------------------------------------------ */
 
-function loadThresholdsFromDisk() {
+function loadConfigFromDisk() {
   try {
-    if (!fs.existsSync(THRESHOLDS_PATH)) {
-      return { ...DEFAULT_THRESHOLDS, ph: { ...DEFAULT_THRESHOLDS.ph }, temp: { ...DEFAULT_THRESHOLDS.temp } };
+    if (!fs.existsSync(SETTINGS_PATH)) {
+      return cloneDefaultConfig();
     }
-
-    const raw = fs.readFileSync(THRESHOLDS_PATH, "utf8");
+    const raw = fs.readFileSync(SETTINGS_PATH, "utf8");
     const parsed = JSON.parse(raw);
-    const validated = validateThresholds(parsed);
-    return validated;
+    return normalizeConfig(parsed);
   } catch (err) {
     console.error(
-      "Failed to load alarm thresholds from disk, using defaults:",
+      "Failed to load alarm settings from disk, using defaults:",
       err.message,
     );
-    // Fall back to defaults
-    return {
-      ph: { ...DEFAULT_THRESHOLDS.ph },
-      temp: { ...DEFAULT_THRESHOLDS.temp },
-    };
+    return cloneDefaultConfig();
   }
 }
 
-function applyThresholdsToRules(thresholds) {
-  for (const rule of ALARM_RULES) {
-    if (rule.type !== "metric_threshold") continue;
-
-    if (rule.metric === "ph") {
-      rule.low = thresholds.ph.low;
-      rule.high = thresholds.ph.high;
-    } else if (rule.metric === "temp1_C") {
-      rule.low = thresholds.temp.low;
-      rule.high = thresholds.temp.high;
-    }
-  }
+function cloneDefaultConfig() {
+  return {
+    ph: { ...DEFAULT_CONFIG.ph },
+    temp: { ...DEFAULT_CONFIG.temp },
+    connectivity: { ...DEFAULT_CONFIG.connectivity },
+  };
 }
 
-function validateThresholdBlock(name, block) {
-  if (!block || typeof block !== "object") {
-    throw new Error(`Missing ${name} thresholds`);
-  }
-
-  const low = Number(block.low);
-  const high = Number(block.high);
+function validateThresholdBlock(name, block, fallback) {
+  const src = block && typeof block === "object" ? block : fallback;
+  const low = Number(src.low);
+  const high = Number(src.high);
 
   if (!Number.isFinite(low) || !Number.isFinite(high)) {
     throw new Error(`${name} thresholds must be numeric`);
@@ -327,20 +323,42 @@ function validateThresholdBlock(name, block) {
   return { low, high };
 }
 
-function validateThresholds(obj) {
-  if (!obj || typeof obj !== "object") {
-    throw new Error("Threshold payload must be an object");
-  }
+function normalizeConfig(obj) {
+  if (!obj || typeof obj !== "object") obj = {};
 
-  const ph = validateThresholdBlock("ph", obj.ph);
-  const temp = validateThresholdBlock("temp", obj.temp);
+  const ph = validateThresholdBlock("ph", obj.ph, DEFAULT_CONFIG.ph);
+  const temp = validateThresholdBlock(
+    "temp",
+    obj.temp,
+    DEFAULT_CONFIG.temp,
+  );
 
-  return { ph, temp };
+  const connRaw = obj.connectivity || {};
+  const qcAlarmsEnabled =
+    typeof connRaw.qcAlarmsEnabled === "boolean"
+      ? connRaw.qcAlarmsEnabled
+      : true;
+
+  return {
+    ph,
+    temp,
+    connectivity: { qcAlarmsEnabled },
+  };
 }
 
-/**
- * Track rule state; return an event object when it changes.
- */
+function applyConfigToRules(config) {
+  for (const rule of ALARM_RULES) {
+    if (rule.type !== "metric_threshold") continue;
+    if (rule.metric === "ph") {
+      rule.low = config.ph.low;
+      rule.high = config.ph.high;
+    } else if (rule.metric === "temp1_C") {
+      rule.low = config.temp.low;
+      rule.high = config.temp.high;
+    }
+  }
+}
+
 function updateRuleState(
   rule,
   tankId,
@@ -352,11 +370,7 @@ function updateRuleState(
 ) {
   const key = `${rule.id}|${tankId}`;
   const prev = alarmState.get(key) || { active: false, lastChange: 0 };
-
-  // No state change → no event
-  if (active === prev.active) {
-    return null;
-  }
+  if (active === prev.active) return null;
 
   alarmState.set(key, { active, lastChange: now });
 
@@ -371,10 +385,6 @@ function updateRuleState(
   };
 }
 
-/**
- * Post a plain text message to Slack Incoming Webhook.
- * Uses Node's https module so no extra deps.
- */
 function postToSlack(text) {
   return new Promise((resolve, reject) => {
     if (!WEBHOOK_URL) {
