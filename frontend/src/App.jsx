@@ -1,3 +1,4 @@
+// src/App.jsx
 import React from "react";
 import { BrowserRouter, Navigate, NavLink, Route, Routes } from "react-router-dom";
 import Tanks from "./pages/Tanks.jsx";
@@ -5,6 +6,7 @@ import BmmDashboard from "./pages/BMM.jsx";
 import UtilControllers from "./pages/UtilControllers.jsx";
 import LiveTanks from "./pages/LiveTanks.jsx";
 import History from "./pages/History.jsx";
+import Settings from "./pages/Settings.jsx";   // 👈 NEW
 import NotFound from "./pages/NotFound.jsx";
 import "./App.css";
 
@@ -15,20 +17,41 @@ export default function App() {
         <header className="top-bar">
           <div className="brand">Symbrosia Gateway</div>
           <nav className="nav-links">
-            <NavLink to="/tanks" className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}>
+            <NavLink
+              to="/tanks"
+              className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}
+            >
               Tanks
             </NavLink>
-            <NavLink to="/bmms" className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}>
+            <NavLink
+              to="/bmms"
+              className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}
+            >
               BMMs
             </NavLink>
-            <NavLink to="/utility" className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}>
+            <NavLink
+              to="/utility"
+              className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}
+            >
               Utility
             </NavLink>
-            <NavLink to="/live-tanks" className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}>
+            <NavLink
+              to="/live-tanks"
+              className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}
+            >
               Live Tanks
             </NavLink>
-            <NavLink to="/history" className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}>
+            <NavLink
+              to="/history"
+              className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}
+            >
               History
+            </NavLink>
+            <NavLink
+              to="/settings"
+              className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}
+            >
+              Settings
             </NavLink>
           </nav>
         </header>
@@ -41,6 +64,7 @@ export default function App() {
             <Route path="/utility" element={<UtilControllers />} />
             <Route path="/live-tanks" element={<LiveTanks />} />
             <Route path="/history" element={<History />} />
+            <Route path="/settings" element={<Settings />} /> {/* 👈 NEW */}
             <Route path="*" element={<NotFound />} />
           </Routes>
         </main>

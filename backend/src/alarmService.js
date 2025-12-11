@@ -2,6 +2,11 @@
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import fs from "fs";
+import { promises as fsp } from "fs";
+
+import https from "https";
+import { URL } from "url";
 
 // --- resolve correct .env path ---
 const __filename = fileURLToPath(import.meta.url);
@@ -10,21 +15,34 @@ const __dirname = path.dirname(__filename);
 // Load backend/.env (one directory up from src/)
 dotenv.config({ path: path.join(__dirname, "..", ".env") });
 
-import https from "https";
-import { URL } from "url";
-
 // Slack Incoming Webhook URL from env
 const WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || "";
 
-// Alarm rule definitions
+// Where we persist alarm thresholds so they survive reboots
+// e.g. backend/data/alarm-thresholds.json
+const THRESHOLDS_PATH = path.join(
+  __dirname,
+  "..",
+  "data",
+  "alarm-thresholds.json",
+);
+
+// Default thresholds (what you have today)
+const DEFAULT_THRESHOLDS = {
+  ph: { low: 7.2, high: 8.2 },
+  temp: { low: 18, high: 27.5 },
+};
+
+// Alarm rule definitions – low/high values will be kept in sync with
+// the current thresholds at startup and whenever they are changed.
 const ALARM_RULES = [
   {
     id: "ctrl_ph_out_of_range",
     family: "ctrl",
     type: "metric_threshold",
     metric: "ph",
-    low: 7.2,
-    high: 8.2,
+    low: DEFAULT_THRESHOLDS.ph.low,
+    high: DEFAULT_THRESHOLDS.ph.high,
     severity: "warning",
     description: "pH",
   },
@@ -33,8 +51,8 @@ const ALARM_RULES = [
     family: "ctrl",
     type: "metric_threshold",
     metric: "temp1_C",
-    low: 18,
-    high: 27.5,
+    low: DEFAULT_THRESHOLDS.temp.low,
+    high: DEFAULT_THRESHOLDS.temp.high,
     severity: "warning",
     description: "Temp",
   },
@@ -53,6 +71,10 @@ const alarmState = new Map();
 
 // Events waiting to be batched into the next Slack message
 const pendingEvents = [];
+
+// Current thresholds (initialized from disk or defaults)
+let currentThresholds = loadThresholdsFromDisk();
+applyThresholdsToRules(currentThresholds);
 
 /**
  * Entry point: call this for every telemetry payload.
@@ -88,16 +110,16 @@ export function processTelemetryForAlarms(payload, family, opts = {}) {
         continue;
       }
 
-      const tooLow =
-        typeof rule.low === "number" && value < rule.low;
-      const tooHigh =
-        typeof rule.high === "number" && value > rule.high;
+      const tooLow = typeof rule.low === "number" && value < rule.low;
+      const tooHigh = typeof rule.high === "number" && value > rule.high;
 
       active = tooLow || tooHigh;
 
       if (active) {
         const dir = tooLow ? "LOW" : "HIGH";
-        details = `${rule.metric}=${value.toFixed(2)} (${dir}) thresholds [${rule.low}, ${rule.high}]`;
+        details = `${rule.metric}=${value.toFixed(
+          2,
+        )} (${dir}) thresholds [${rule.low}, ${rule.high}]`;
       }
     } else if (rule.type === "qc_fail") {
       active = qcStatus === "fail";
@@ -160,11 +182,11 @@ export async function flushAlarmBatch() {
       );
       const sevLabel = sevSet.size === 1 ? [...sevSet][0] : "MIXED";
 
+      // sevLabel is there if you ever want to decorate, but we don't
+      // currently prepend it to each line to keep things clean.
       for (const e of alarms) {
         const label = e.rule.description || e.rule.id;
-        lines.push(
-          `• ${label}` + (e.details ? ` — ${e.details}` : ""),
-        );
+        lines.push(`• ${label}` + (e.details ? ` — ${e.details}` : ""));
       }
     }
 
@@ -198,6 +220,122 @@ export async function flushAlarmBatch() {
   } finally {
     pendingEvents.length = 0; // clear batch either way
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*        NEW: getters/setters for thresholds + JSON persistence      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Read the current thresholds (safe clone so callers can't mutate in place).
+ */
+export function getAlarmThresholds() {
+  return {
+    ph: { ...currentThresholds.ph },
+    temp: { ...currentThresholds.temp },
+  };
+}
+
+/**
+ * Update thresholds from the API and persist them to disk.
+ * Expects payload like:
+ * {
+ *   ph:   { low: number, high: number },
+ *   temp: { low: number, high: number }
+ * }
+ */
+export async function setAlarmThresholds(payload) {
+  const next = validateThresholds(payload);
+
+  // Update in-memory thresholds
+  currentThresholds = next;
+  applyThresholdsToRules(next);
+
+  // Persist to disk
+  try {
+    await fsp.mkdir(path.dirname(THRESHOLDS_PATH), { recursive: true });
+    await fsp.writeFile(
+      THRESHOLDS_PATH,
+      JSON.stringify(next, null, 2),
+      "utf8",
+    );
+  } catch (err) {
+    console.error("Failed to persist alarm thresholds:", err.message);
+    // Surface this so the API can return 500 if needed
+    throw new Error("Failed to persist alarm thresholds");
+  }
+
+  return getAlarmThresholds();
+}
+
+/* ------------------------------------------------------------------ */
+/*                    Internal helpers & utilities                     */
+/* ------------------------------------------------------------------ */
+
+function loadThresholdsFromDisk() {
+  try {
+    if (!fs.existsSync(THRESHOLDS_PATH)) {
+      return { ...DEFAULT_THRESHOLDS, ph: { ...DEFAULT_THRESHOLDS.ph }, temp: { ...DEFAULT_THRESHOLDS.temp } };
+    }
+
+    const raw = fs.readFileSync(THRESHOLDS_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    const validated = validateThresholds(parsed);
+    return validated;
+  } catch (err) {
+    console.error(
+      "Failed to load alarm thresholds from disk, using defaults:",
+      err.message,
+    );
+    // Fall back to defaults
+    return {
+      ph: { ...DEFAULT_THRESHOLDS.ph },
+      temp: { ...DEFAULT_THRESHOLDS.temp },
+    };
+  }
+}
+
+function applyThresholdsToRules(thresholds) {
+  for (const rule of ALARM_RULES) {
+    if (rule.type !== "metric_threshold") continue;
+
+    if (rule.metric === "ph") {
+      rule.low = thresholds.ph.low;
+      rule.high = thresholds.ph.high;
+    } else if (rule.metric === "temp1_C") {
+      rule.low = thresholds.temp.low;
+      rule.high = thresholds.temp.high;
+    }
+  }
+}
+
+function validateThresholdBlock(name, block) {
+  if (!block || typeof block !== "object") {
+    throw new Error(`Missing ${name} thresholds`);
+  }
+
+  const low = Number(block.low);
+  const high = Number(block.high);
+
+  if (!Number.isFinite(low) || !Number.isFinite(high)) {
+    throw new Error(`${name} thresholds must be numeric`);
+  }
+  if (low >= high) {
+    throw new Error(`${name} low must be less than high`);
+  }
+
+  return { low, high };
+}
+
+function validateThresholds(obj) {
+  if (!obj || typeof obj !== "object") {
+    throw new Error("Threshold payload must be an object");
+  }
+
+  const ph = validateThresholdBlock("ph", obj.ph);
+  const temp = validateThresholdBlock("temp", obj.temp);
+
+  return { ph, temp };
 }
 
 /**
