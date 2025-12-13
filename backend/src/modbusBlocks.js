@@ -8,6 +8,8 @@
 
 import net from "net";
 import Modbus from "jsmodbus";
+import { publishTelemetry } from "./mqttPublisher.js";
+
 
 /** ---------- simple concurrency limiter (instead of p-limit) ---------- */
 function createLimiter(concurrency) {
@@ -231,11 +233,12 @@ function wait(ms) {
  */
 export async function runCycleForFamily(
   family,
-  mqttPublisher,
-  loggingService,
+  mqttClient,
+  siteId,
   onLiveUpdate,
   liveTanks
-) {
+)
+ {
   const { family: familyName, config, mapCtx, devicePrefix, blocks } = family;
   const tanks = Object.keys(config);
   const limit = createLimiter(8);
@@ -266,7 +269,7 @@ export async function runCycleForFamily(
         const payload = {
           ts_utc: new Date().toISOString(),
           schema_ver: mapCtx.map?.schema_ver || 1,
-          site_id: mqttPublisher.siteId,
+          site_id: siteId,
           tank_id: tankId,
           device_id: deviceId,
           fw: "gw-1.0.0",
@@ -274,8 +277,8 @@ export async function runCycleForFamily(
           qc: { status: "ok" }
         };
 
-        mqttPublisher.publishTelemetry(familyName, payload);
-        loggingService.logTelemetry(familyName, payload);
+        publishTelemetry(mqttClient, payload, familyName);
+
 
         if (onLiveUpdate) {
           onLiveUpdate(tankId, ip, payload);

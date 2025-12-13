@@ -5,7 +5,7 @@ import { promises as fsp } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import http from "http";
-import mqtt from "mqtt";
+import { createMqttClient, publishTelemetry } from "./mqttPublisher.js";
 
 import {
   processTelemetryForAlarms,
@@ -15,7 +15,7 @@ import {
 } from "./alarmService.js";
 import { loadRegisterMap, getBlocks, decodePointsFromBlocks } from "./registerMap.js";
 import { readBlocksForDevice } from "./modbusBlocks.js";
-import { initLogger, logTelemetry, shutdownLogger, getLogDirectory } from "./loggingService.js";
+import { initLogger, shutdownLogger, getLogDirectory } from "./loggingService.js";
 
 // ---- path helpers ----
 const __filename = fileURLToPath(import.meta.url);
@@ -140,37 +140,57 @@ function charIsDigit(ch) {
 
 // Very small parser: "ph" => { fam: null, field: "ph" }
 // "ctrl.ph" => { fam: "ctrl", field: "ph" }, etc.
+// "ph" => { family: null, field: "ph" }
+// "ctrl.ph" => { family: "ctrl", field: "ph" }
 function resolveMetricSpec(raw) {
   if (!raw) return null;
   const value = String(raw).trim();
   if (!value) return null;
 
   const parts = value.split(".");
+  let family = null;
+  let field = null;
+
   if (parts.length === 1) {
-    return { family: null, field: parts[0] };
+    field = parts[0];
+  } else if (parts.length === 2) {
+    family = parts[0] || null;
+    field = parts[1];
+  } else {
+    return null;
   }
-  if (parts.length === 2) {
-    const [fam, field] = parts;
-    return { family: fam || null, field };
-  }
-  return null;
+
+  // Back-compat for History UI: it requests metric=temp but we log temp1_C
+  if (field === "temp") field = "temp1_C";
+
+  return { family, field };
 }
 
-// Parse NDJSON file path for logs
+// Get NDJSON log files for a tank.
+// New filename format from loggingService:
+// telemetry-<family>-<site>-<tank>-<YYYY-MM-DD>.ndjson
 function getLogFilePathsForTank(tankId) {
   const dir = getLogDirectory();
   const entries = fs.readdirSync(dir, { withFileTypes: true });
+
   const files = [];
   for (const ent of entries) {
     if (!ent.isFile()) continue;
     if (!ent.name.endsWith(".ndjson")) continue;
-    if (!ent.name.includes(`.${tankId}.`)) continue;
+
+    // Tank appears as `-<tankId>-` in the filename
+    if (!ent.name.includes(`-${tankId}-`)) continue;
+
     files.push(path.join(dir, ent.name));
   }
+
+  // Optional: sort by filename so days process in order
+  files.sort();
   return files;
 }
 
-// read NDJSON logs and create a simple time series
+// Read NDJSON logs and create a time series that matches History.jsx:
+// [{ ts: ISOString, value: number }, ...]
 async function readLogSeries(tankId, metricSpec, startMs, endMs) {
   const files = getLogFilePathsForTank(tankId);
   if (!files.length) return [];
@@ -178,37 +198,46 @@ async function readLogSeries(tankId, metricSpec, startMs, endMs) {
   const out = [];
 
   for (const f of files) {
-    const raw = await fsp.readFile(f, "utf8");
+    let raw = "";
+    try {
+      raw = await fsp.readFile(f, "utf8");
+    } catch {
+      continue;
+    }
+
     const lines = raw.split(/\r?\n/);
     for (const line of lines) {
       if (!line) continue;
+
       let row;
       try {
         row = JSON.parse(line);
       } catch {
-        continue; // skip invalid row
+        continue;
       }
-      const t = Date.parse(row.ts_utc || row.ts || row.ts_local || row.time);
+
+      const t = Date.parse(row.ts_hst || row.ts_utc || row.ts || row.ts_local || row.time);
       if (!Number.isFinite(t)) continue;
       if (t < startMs || t > endMs) continue;
 
-      // optional family filter
+      // Optional family filter (only applies if your rows include `family`)
       if (metricSpec.family && row.family && row.family !== metricSpec.family) {
         continue;
       }
 
-      const s = row.s || row.values || {};
+      // Your logger writes metrics at the top-level, but support older shapes too
+      const s = row.s || row.values || row || {};
       const v = s[metricSpec.field];
+
       if (typeof v !== "number" || !Number.isFinite(v)) continue;
 
-      out.push({ t, v });
+      out.push({ ts: new Date(t).toISOString(), value: v });
     }
   }
 
-  out.sort((a, b) => a.t - b.t);
+  out.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   return out;
-}
-
+} 
 async function handleApiRequest(req, res) {
   setCorsHeaders(res);
 
@@ -350,40 +379,8 @@ async function handleApiRequest(req, res) {
 let apiServer;
 
 // ---- MQTT wiring ----
-function createMqttUrl() {
-  const host = process.env.MQTT_HOST || "localhost";
-  const port = Number(process.env.MQTT_PORT || 1883);
-  const proto = process.env.MQTT_TLS === "1" ? "mqtts" : "mqtt";
-  return `${proto}://${host}:${port}`;
-}
+const mqttClient = createMqttClient(process.env);
 
-function createMqttClient() {
-  const url = createMqttUrl();
-  const opts = {
-    username: process.env.MQTT_USER || undefined,
-    password: process.env.MQTT_PASS || undefined,
-    reconnectPeriod: 2000,
-    keepalive: 30,
-    clean: true,
-  };
-  const client = mqtt.connect(url, opts);
-
-  client.on("connect", () => {
-    console.log(`✅ MQTT connected → ${url}`);
-  });
-  client.on("reconnect", () => console.log("… MQTT reconnecting …"));
-  client.on("error", (e) => console.error("MQTT error:", e.message));
-  client.on("close", () => console.log("MQTT connection closed"));
-
-  return client;
-}
-
-function publishTelemetry(mqttClient, payload) {
-  const tankId = payload.tank_id;
-  const deviceId = payload.device_id;
-  const topic = `symbrosia/${payload.site_id}/${tankId}/${deviceId}/telemetry`;
-  mqttClient.publish(topic, JSON.stringify(payload), { qos: 0, retain: false });
-}
 
 // ---- family discovery ----
 // Map config filename to (family id, register map path)
@@ -468,8 +465,7 @@ async function pollDevice(mqttClient, family, device) {
     };
     updateLiveCache(tankId, fam, ip, payload);
 
-    publishTelemetry(mqttClient, payload);
-    await logTelemetry(payload);
+    publishTelemetry(mqttClient, payload, fam);
     processTelemetryForAlarms(payload, fam);
 
     // Friendly per-family log
@@ -500,10 +496,10 @@ async function pollDevice(mqttClient, family, device) {
     };
 
     // Publish fail frame so downstream can detect staleness
-    publishTelemetry(mqttClient, failPayload);
+    publishTelemetry(mqttClient, failPayload, fam);
 
     // NEW: fire QC fail alarms
-    processTelemetryForAlarms(failPayload, family.family, { error: e });
+    processTelemetryForAlarms(failPayload, fam, { error: e });
 
     console.error(`❌ ${family.family}:${tankId} @ ${ip}: ${e.message}`);
   }
@@ -532,7 +528,6 @@ async function pollAllFamilies(mqttClient, families) {
 }
 
 // ---- main loop + reload ----
-const mqttClient = createMqttClient();
 initLogger();
 
 let families = loadFamilies();

@@ -3,8 +3,22 @@
 // ---------------------------------------------------------
 
 // Prefer backend URL from environment (.env.production)
-const API_BASE =
-  (import.meta.env?.VITE_API_BASE || "http://192.168.0.140:4000").replace(/\/+$/, "");
+// Prefer backend URL from environment
+const envBase = import.meta.env?.VITE_API_BASE;
+
+// Dev default: same host as frontend, backend on :4000
+const defaultDevBase =
+  typeof window !== "undefined"
+    ? `${window.location.protocol}//${window.location.hostname}:4000`
+    : "";
+
+// Prod default: Pi IP
+const defaultProdBase = "http://192.168.0.140:4000";
+
+const API_BASE = (
+  envBase ||
+  (import.meta.env?.DEV ? defaultDevBase : defaultProdBase)
+).replace(/\/+$/, "");
 
 /**
  * Build a full API URL.

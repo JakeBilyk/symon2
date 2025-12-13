@@ -1,5 +1,5 @@
 // backend/src/loggingService.js
-// NDJSON telemetry logger with per-family files, daily rotation, per-device rate limiting,
+// NDJSON telemetry logger with per-tank files, daily rotation, per-device rate limiting,
 // and a small write queue. Family-specific whitelists supported via:
 //   backend/config/logPoints.<family>.json
 // Falls back to backend/config/logPoints.json if family file missing.
@@ -10,19 +10,16 @@ import { fileURLToPath } from "url";
 
 // ---------- path & env ----------
 const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
+const __dirname = path.dirname(__filename);
 
-const LOG_DIR = (process.env.LOG_DIR?.trim && process.env.LOG_DIR.trim())
-  || path.join(__dirname, "..", "data", "logs");
+const LOG_DIR =
+  (process.env.LOG_DIR?.trim && process.env.LOG_DIR.trim()) ||
+  path.join(__dirname, "..", "data", "logs");
 
-const SITE_ID_DEFAULT = process.env.SITE_ID || "site";
-const LOG_POINTS_DEFAULT_PATH = path.join(__dirname, "..", "config", "logPoints.json");
+// Rate limiting per (family/site/tank). Default 30s.
+const MIN_INTERVAL_MS = Number(process.env.LOG_MIN_INTERVAL_MS || 30_000);
 
-// Minimum interval (ms) between logs per (family,site,tank). Default = 5 minutes.
-const LOG_MIN_INTERVAL_MS = Number(process.env.LOG_MIN_INTERVAL_MS || 300_000);
-
-// ---------- internal state ----------
-/** Map<key, fs.WriteStream> where key = `${family}:${site}:${dateStr}` */
+// Backpressure handling
 const streams = new Map();
 /** Global write queue of { stream, line } to handle backpressure smoothly */
 const queue = [];
@@ -30,54 +27,89 @@ let writing = false;
 
 /** Cache of family -> Set<string> whitelist */
 const whitelistCache = new Map();
-/** Last write time per (family:site:tank) for rate limiting */
+
+/** Map<rateKey, lastWriteMs> */
 const lastWrite = new Map();
 
 // ---------- helpers ----------
 function ensureDirSync(dir) {
-  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function todayStrUTC(date = new Date()) {
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(date.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
+function todayStrUTC(d = new Date()) {
+  // YYYY-MM-DD in UTC
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+function hawaiiNow(d = new Date()) {
+  // Hawaiʻi Standard Time is always UTC-10 (no DST)
+  const HST_OFFSET_MS = -10 * 60 * 60 * 1000;
+  return new Date(d.getTime() + HST_OFFSET_MS);
 }
 
-function familyFromDeviceId(deviceId = "") {
-  // Expect "<family>-<rest>", e.g., "ctrl-C01", "bmm-C01", "util-CO2_A"
-  const idx = deviceId.indexOf("-");
-  return (idx > 0 ? deviceId.slice(0, idx) : "ctrl").toLowerCase();
+function nowHawaiiISO(d = new Date()) {
+  // ISO string with explicit -10:00 offset
+  return hawaiiNow(d).toISOString().replace("Z", "-10:00");
 }
 
-function whitelistPathForFamily(family) {
-  const alt = path.join(__dirname, "..", "config", `logPoints.${family}.json`);
-  return fs.existsSync(alt) ? alt : LOG_POINTS_DEFAULT_PATH;
+function todayStrHawaii(d = new Date()) {
+  // YYYY-MM-DD in Hawaiʻi time (so your daily files align with your day)
+  const hst = hawaiiNow(d);
+  const yyyy = hst.getUTCFullYear();
+  const mm = String(hst.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(hst.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
+// Load or return cached whitelist Set for family
 function loadWhitelistForFamily(family) {
   if (whitelistCache.has(family)) return whitelistCache.get(family);
+
+  const cfgDir = path.join(__dirname, "..", "config");
+  const famPath = path.join(cfgDir, `logPoints.${family}.json`);
+  const defaultPath = path.join(cfgDir, "logPoints.json");
+
+  let raw;
   try {
-    const p = whitelistPathForFamily(family);
-    const raw = fs.readFileSync(p, "utf8");
-    const cfg = JSON.parse(raw);
-    if (!cfg || !Array.isArray(cfg.log_points)) throw new Error("missing 'log_points' array");
-    const set = new Set(cfg.log_points);
+    if (fs.existsSync(famPath)) raw = fs.readFileSync(famPath, "utf-8");
+    else raw = fs.readFileSync(defaultPath, "utf-8");
+  } catch (e) {
+    console.warn(
+      `logger: could not read whitelist for family '${family}': ${e.message}`
+    );
+    const empty = new Set();
+    whitelistCache.set(family, empty);
+    return empty;
+  }
+
+  try {
+    const json = JSON.parse(raw);
+    // supports either { points:[...]} or simple array
+    const points = Array.isArray(json)
+  ? json
+  : (json?.log_points || json?.points || []);
+
+    const set = new Set(points);
     whitelistCache.set(family, set);
     return set;
   } catch (e) {
-    console.error(`Failed to load whitelist for family "${family}":`, e.message);
+    console.warn(
+      `logger: invalid whitelist JSON for family '${family}': ${e.message}`
+    );
     const empty = new Set();
     whitelistCache.set(family, empty);
     return empty;
   }
 }
 
-function truncateValue(key, value) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return value;
-  if (key === "counter_value" || key === "timer_seconds") return Math.trunc(value);
-  return Math.round(value * 10) / 10; // 1 decimal place
+function truncateValue(key, v) {
+  // Keep floats tidy; leave ints/bools/strings untouched.
+  if (typeof v !== "number") return v;
+  if (!Number.isFinite(v)) return v;
+  // reduce typical sensor noise + file size
+  return Math.round(v * 10) / 10; // 1 decimal place
 }
 
 function filteredSubset(sensorDict, allowSet) {
@@ -88,16 +120,18 @@ function filteredSubset(sensorDict, allowSet) {
   return out;
 }
 
-function fileName(family, site, dateStr) {
-  return `telemetry-${family}-${site}-${dateStr}.ndjson`;
+function fileName(family, site, tank, dateStr) {
+  // Per-tank, per-day NDJSON file for fast History queries and minimal scanning
+  return `telemetry-${family}-${site}-${tank}-${dateStr}.ndjson`;
 }
 
-function getStream(family, site, dateStr) {
-  const key = `${family}:${site}:${dateStr}`;
+function getStream(family, site, tank, dateStr) {
+  // Include tank in key so we never mix tanks into the same file/stream
+  const key = `${family}:${site}:${tank}:${dateStr}`;
   if (streams.has(key)) return streams.get(key);
 
   ensureDirSync(LOG_DIR);
-  const fpath = path.join(LOG_DIR, fileName(family, site, dateStr));
+  const fpath = path.join(LOG_DIR, fileName(family, site, tank, dateStr));
   const stream = fs.createWriteStream(fpath, { flags: "a" });
   stream.on("error", (e) => console.error("NDJSON stream error:", e.message));
   streams.set(key, stream);
@@ -120,7 +154,7 @@ async function flushQueue() {
 }
 
 // ---------- public API ----------
-/** Initialize logging directory (idempotent). */
+/** Ensure log directory exists. Call once on server startup. */
 export function initLogger() {
   ensureDirSync(LOG_DIR);
 }
@@ -135,35 +169,34 @@ export function getLogDirectory() {
  * Log a telemetry payload (rate-limited per family/site/tank).
  * Payload shape:
  * {
- *   ts_utc, site_id, tank_id, device_id, s: {...}, qc: {status}
+ *   ts_utc, site_id, tank_id, device_id,
+ *   s: {...},            // sensor values
+ *   qc: { status: ... }  // optional quality/control status
  * }
  */
-export async function logTelemetry(payload) {
+export function logTelemetry(payload, familyOverride = null) {
   try {
-    initLogger();
+    const fam = String(familyOverride || payload?.family || payload?.site_family || "unknown");
+    const site = String(payload?.site_id ?? "unknown");
+    const tank = String(payload?.tank_id ?? "unknown");
 
-    const site = (payload?.site_id || SITE_ID_DEFAULT);
-    const fam  = familyFromDeviceId(payload?.device_id || "");
-    const tank = payload?.tank_id || "unknown";
-    const ts   = Date.now();
-
-    // Rate limit per (family:site:tank)
     const rateKey = `${fam}:${site}:${tank}`;
+    const ts = Date.now();
     const last = lastWrite.get(rateKey) || 0;
-    if (ts - last < LOG_MIN_INTERVAL_MS) return;
+    if (ts - last < MIN_INTERVAL_MS) return;
 
-    const dateStr = todayStrUTC(payload?.ts_utc ? new Date(payload.ts_utc) : new Date());
-    const stream  = getStream(fam, site, dateStr);
+    const dateStr = todayStrHawaii(
+      payload?.ts_utc ? new Date(payload.ts_utc) : new Date()
+    );
+    const stream = getStream(fam, site, tank, dateStr);
 
     const allowSet = loadWhitelistForFamily(fam);
     const row = {
-      ts_utc: payload?.ts_utc || new Date().toISOString(),
-      site_id: site,
+      ts_hst: nowHawaiiISO(payload?.ts_utc ? new Date(payload.ts_utc) : new Date()),
       tank_id: tank,
-      device_id: payload?.device_id,
-      qc: payload?.qc?.status || "ok",
-      ...filteredSubset(payload?.s || {}, allowSet)
+      ...filteredSubset(payload?.s || {}, allowSet),
     };
+    
 
     queue.push({ stream, line: JSON.stringify(row) + "\n" });
     lastWrite.set(rateKey, ts);
@@ -173,7 +206,10 @@ export async function logTelemetry(payload) {
   }
 }
 
-/** Flush queue and close all open streams. Call on shutdown. */
+/**
+ * Close any open file streams and drain the queue.
+ * Call on SIGINT/SIGTERM for clean shutdown.
+ */
 export async function shutdownLogger() {
   try {
     while (queue.length) {
@@ -182,7 +218,10 @@ export async function shutdownLogger() {
     // Close all open streams
     await Promise.all(
       Array.from(streams.values()).map(
-        (s) => new Promise((res) => { s.end(() => res()); })
+        (s) =>
+          new Promise((res) => {
+            s.end(() => res());
+          })
       )
     );
     streams.clear();
