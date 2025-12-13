@@ -12,34 +12,29 @@ export default function Tanks() {
   const [error, setError] = useState("");
 
   // Shared loader so we can call it from both the poller and any future actions
-  const loadSnapshots = useCallback(
-    async (isInitial = false) => {
-      if (isInitial) {
-        setLoading(true);
-      }
+  const loadSnapshots = useCallback(async (isInitial = false) => {
+    if (isInitial) setLoading(true);
 
-      try {
-        const [liveData, liveTanks] = await Promise.all([
-          fetchJson("/api/live"),
-          fetchJson("/api/live-tanks"),
-        ]);
+    try {
+      const [liveData, liveTanks] = await Promise.all([
+        fetchJson("/api/live"),
+        fetchJson("/api/live-tanks"),
+      ]);
 
-        const payload =
-          liveData && typeof liveData === "object" && !Array.isArray(liveData)
-            ? liveData
-            : {};
+      const payload =
+        liveData && typeof liveData === "object" && !Array.isArray(liveData)
+          ? liveData
+          : {};
 
-        setSnapshots(payload);
-        setLiveMap(liveTanks?.liveTanks || {});
-        setError("");
-      } catch (e) {
-        setError(e?.message || "Failed to load latest snapshots");
-      } finally {
-        setLoading(false);
-      }
-    },
-    [],
-  );
+      setSnapshots(payload);
+      setLiveMap(liveTanks?.liveTanks || {});
+      setError("");
+    } catch (e) {
+      setError(e?.message || "Failed to load latest snapshots");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -62,7 +57,14 @@ export default function Tanks() {
     };
   }, [loadSnapshots]);
 
-  const cards = useMemo(() => {
+  /**
+   * Returns grouped entries:
+   * [
+   *   ["C", [ [tankId, snapshot], ... ]],
+   *   ["D", [ ... ]],
+   * ]
+   */
+  const groupedCards = useMemo(() => {
     const entries = Object.entries(snapshots || {});
 
     // Only keep controller family on this page
@@ -78,11 +80,22 @@ export default function Tanks() {
       return liveMap?.[tankId] !== false;
     });
 
+    // Sort tanks (within overall list)
     filtered.sort(([a], [b]) =>
-      a.localeCompare(b, undefined, { numeric: true }),
+      a.localeCompare(b, undefined, { numeric: true })
     );
 
-    return filtered;
+    // Group by prefix (leading letters)
+    const grouped = {};
+    for (const entry of filtered) {
+      const [tankId] = entry;
+      const prefix = tankPrefix(tankId);
+      if (!grouped[prefix]) grouped[prefix] = [];
+      grouped[prefix].push(entry);
+    }
+
+    // Sort groups by prefix
+    return Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b));
   }, [snapshots, liveMap]);
 
   return (
@@ -102,62 +115,69 @@ export default function Tanks() {
         <div className="empty-state">
           <p>Loading cached telemetry…</p>
         </div>
-      ) : cards.length > 0 ? (
+      ) : groupedCards.length > 0 ? (
         <div className="cards-grid cards-grid-dense">
-          {cards.map(([tankId, snapshot]) => {
-            const phValue = snapshot?.ph;
-            const tempValue = snapshot?.temp1_C;
-            const updatedIso = snapshot?.ts_utc;
-            const qcLabel =
-              typeof snapshot?.qc === "string"
-                ? snapshot.qc.toUpperCase()
-                : "—";
-            const qcClass =
-              snapshot?.qc === "ok"
-                ? "ok"
-                : snapshot?.qc === "fail"
-                ? "fail"
-                : "";
-            const stale = isSnapshotStale(updatedIso);
-            const timestampClasses = ["timestamp", stale ? "stale" : "fresh"];
+          {groupedCards.map(([prefix, group]) => (
+            <React.Fragment key={prefix}>
+              {/* Divider spans full grid width */}
+              <div className="cards-divider">
+                <h2>{prefix}</h2>
+              </div>
 
-            return (
-              <article key={tankId} className="card card-compact">
-                <header className="card-header">
-                  <h3>{tankId}</h3>
-                  <div className="pill-group">
-                    {qcClass === "fail" && (
-                      <span className="qc-pill fail">FAIL</span>
-                    )}
-                    {stale && <span className="qc-pill fail">STALE</span>}
-                  </div>
-                </header>
+              {group.map(([tankId, snapshot]) => {
+                const phValue = snapshot?.ph;
+                const tempValue = snapshot?.temp1_C;
+                const updatedIso = snapshot?.ts_utc;
 
-                <dl className="metric-list">
-                  <Metric
-                    label="pH"
-                    value={formatNumber(phValue, 2)}
-                    status={classifyPh(phValue)}
-                  />
-                  <Metric
-                    label="Temp (°C)"
-                    value={formatNumber(tempValue, 1)}
-                    status={classifyTemperature(tempValue)}
-                  />
-                </dl>
+                const qcClass =
+                  snapshot?.qc === "ok"
+                    ? "ok"
+                    : snapshot?.qc === "fail"
+                    ? "fail"
+                    : "";
 
-                <footer className="card-meta">
-                  <span title="Controller IP">{snapshot?.ip || "—"}</span>
-                  <span
-                    className={timestampClasses.join(" ")}
-                    title={formatExactTimestamp(updatedIso)}
-                  >
-                    {formatUpdatedAgo(updatedIso)}
-                  </span>
-                </footer>
-              </article>
-            );
-          })}
+                const stale = isSnapshotStale(updatedIso);
+                const timestampClasses = ["timestamp", stale ? "stale" : "fresh"];
+
+                return (
+                  <article key={tankId} className="card card-compact">
+                    <header className="card-header">
+                      <h3>{tankId}</h3>
+                      <div className="pill-group">
+                        {qcClass === "fail" && (
+                          <span className="qc-pill fail">FAIL</span>
+                        )}
+                        {stale && <span className="qc-pill fail">STALE</span>}
+                      </div>
+                    </header>
+
+                    <dl className="metric-list">
+                      <Metric
+                        label="pH"
+                        value={formatNumber(phValue, 2)}
+                        status={classifyPh(phValue)}
+                      />
+                      <Metric
+                        label="Temp (°C)"
+                        value={formatNumber(tempValue, 1)}
+                        status={classifyTemperature(tempValue)}
+                      />
+                    </dl>
+
+                    <footer className="card-meta">
+                      <span title="Controller IP">{snapshot?.ip || "—"}</span>
+                      <span
+                        className={timestampClasses.join(" ")}
+                        title={formatExactTimestamp(updatedIso)}
+                      >
+                        {formatUpdatedAgo(updatedIso)}
+                      </span>
+                    </footer>
+                  </article>
+                );
+              })}
+            </React.Fragment>
+          ))}
         </div>
       ) : (
         <div className="empty-state">
@@ -166,6 +186,13 @@ export default function Tanks() {
       )}
     </section>
   );
+}
+
+function tankPrefix(tankId) {
+  if (!tankId || typeof tankId !== "string") return "Other";
+  // Leading letters: C01 -> C, CTRL-01 -> CTRL, i7 -> I
+  const m = tankId.match(/^[A-Za-z]+/);
+  return m ? m[0].toUpperCase() : "Other";
 }
 
 function Metric({ label, value, status }) {

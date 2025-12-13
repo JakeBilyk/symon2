@@ -99,6 +99,20 @@
   box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
 }
 
+.cards-divider {
+  grid-column: 1 / -1;
+  margin: 1rem 0 0.5rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.cards-divider h2 {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
 .cards-grid {
   display: grid;
   gap: 16px;
