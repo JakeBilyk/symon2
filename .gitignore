@@ -14,6 +14,7 @@ backend/data/alarm-settings.json
 
 # Optional — if you later move live data here:
 backend/data/liveTanks.json
+backend/config/liveTanks.json
 
 # ----------------------------
 # Build artifacts (should never be committed)
