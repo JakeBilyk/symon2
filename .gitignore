@@ -12,10 +12,12 @@ backend/data/logs/
 backend/data/alarm-thresholds.json
 backend/data/alarm-settings.json
 
-# Optional — if you later move live data here:
+# Tank specific live data (should not be committed)
 backend/data/liveTanks.json
 backend/config/liveTanks.json
-
+backend/config/tankConfig.json
+backend/config/utilityConfig.json
+backend/config/bmmConfig.json
 # ----------------------------
 # Build artifacts (should never be committed)
 # ----------------------------
