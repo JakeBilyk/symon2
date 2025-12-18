@@ -1,0 +1,6 @@
+{
+  "defaultLpm": 2.5,
+  "perTank": {
+    "D01": 1
+  }
+}

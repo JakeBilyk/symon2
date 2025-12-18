@@ -8,7 +8,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { fetchJson } from "../utils/api.js";
+import { apiUrl, fetchJson } from "../utils/api.js";
 
 // Force Hawaiʻi time display (HST, no DST)
 const formatter = new Intl.DateTimeFormat("en-US", {
@@ -20,7 +20,6 @@ const formatter = new Intl.DateTimeFormat("en-US", {
 });
 
 // For <input type="datetime-local"> value (always interpreted as local time)
-// Since you said "assume we’re always in Hawaiʻi", this is exactly HST in practice.
 function toLocalInputValue(date) {
   const pad = (v) => String(v).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
@@ -34,14 +33,18 @@ function prettyError(err) {
   return err.message || String(err);
 }
 
+function normalizeId(x) {
+  if (!x) return "";
+  if (typeof x === "string") return x;
+  return x.id || x.tankId || x.name || "";
+}
+
 export default function History() {
-  const [tanks, setTanks] = useState([]);
+  const [devices, setDevices] = useState([]); // [{ id, family, label }]
   const [tankId, setTankId] = useState("");
 
-  // Use the actual logged field name now
   const [metric, setMetric] = useState("ph");
 
-  // Default window: last 24 hours (Hawaiʻi local time)
   const [end, setEnd] = useState(() => toLocalInputValue(new Date()));
   const [start, setStart] = useState(() => {
     const d = new Date();
@@ -49,35 +52,60 @@ export default function History() {
     return toLocalInputValue(d);
   });
 
-  const [loadingTanks, setLoadingTanks] = useState(false);
+  const [loadingDevices, setLoadingDevices] = useState(false);
   const [loading, setLoading] = useState(false);
   const [points, setPoints] = useState([]);
   const [error, setError] = useState("");
 
   const metricLabel = metric === "temp1_C" ? "Temperature (°C)" : "pH";
 
-  // Load tanks once
+  // Load ctrl tank IDs + util IDs once
   useEffect(() => {
     (async () => {
-      setLoadingTanks(true);
+      setLoadingDevices(true);
       setError("");
       try {
-        const res = await fetchJson("/api/tanks");
-        const list = Array.isArray(res?.tanks) ? res.tanks : [];
-        setTanks(list);
-        if (!tankId && list.length) setTankId(list[0].id || list[0].tankId || list[0]);
+        const [tanksRes, liveRes] = await Promise.all([
+          fetchJson("/api/tanks"),
+          fetchJson("/api/live"),
+        ]);
+
+        // ctrl: from /api/tanks
+        const ctrlIds = Array.isArray(tanksRes?.tanks)
+          ? tanksRes.tanks.map(normalizeId).filter(Boolean)
+          : [];
+
+        // util: from /api/live (now seeded, so util always appears)
+        const utilIds = Object.entries(liveRes || {})
+          .filter(([, snap]) => snap?.family === "util")
+          .map(([id]) => id)
+          .filter(Boolean);
+
+        const merged = [];
+
+        for (const id of ctrlIds) {
+          merged.push({ id, family: "ctrl", label: `${id} (ctrl)` });
+        }
+        for (const id of utilIds) {
+          // avoid duplicates if any name overlaps
+          if (ctrlIds.includes(id)) continue;
+          merged.push({ id, family: "util", label: `${id} (util)` });
+        }
+
+        merged.sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }));
+
+        setDevices(merged);
+        if (!tankId && merged.length) setTankId(merged[0].id);
       } catch (e) {
-        setError(prettyError(e) || "Failed to load tanks");
+        setError(prettyError(e) || "Failed to load devices");
       } finally {
-        setLoadingTanks(false);
+        setLoadingDevices(false);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const chartData = useMemo(() => {
-    // Accept backend points as {ts,value} OR {ts_hst,value}
-    // (we normalize to {iso,value})
     return (points || [])
       .map((p) => ({
         iso: p.ts || p.ts_hst || p.t || p.time,
@@ -90,7 +118,7 @@ export default function History() {
     setLoading(true);
     setError("");
     try {
-      if (!tankId) throw new Error("Select a tank first");
+      if (!tankId) throw new Error("Select a device first");
 
       const startDate = new Date(start);
       const endDate = new Date(end);
@@ -116,13 +144,36 @@ export default function History() {
     }
   }
 
+  async function downloadLatestLog() {
+    setError("");
+    try {
+      if (!tankId) throw new Error("Select a device first");
+
+      const res = await fetchJson(
+        `/api/log-files?tankId=${encodeURIComponent(tankId)}&limit=1`
+      );
+      const latest = Array.isArray(res?.files) ? res.files[0] : null;
+      if (!latest?.name) throw new Error("No log files found for this device");
+
+      const url = apiUrl(
+        `/api/log-files/download?tankId=${encodeURIComponent(
+          tankId
+        )}&file=${encodeURIComponent(latest.name)}`
+      );
+
+      window.location.href = url;
+    } catch (e) {
+      setError(prettyError(e) || "Failed to download log");
+    }
+  }
+
   return (
     <section className="page">
       <header className="page-header">
         <div>
-          <h1>Tank History</h1>
+          <h1>History</h1>
           <p className="page-subtitle">
-            Plot logged pH or temperature for a selected tank. Times shown in Hawaiʻi (HST).
+            Plot logged pH or temperature for a selected controller (tank or utility). Times shown in Hawaiʻi (HST).
           </p>
         </div>
       </header>
@@ -130,24 +181,20 @@ export default function History() {
       <div className="card">
         <div className="controls">
           <label>
-            Tank
+            Device
             <select
               value={tankId}
               onChange={(e) => setTankId(e.target.value)}
-              disabled={loadingTanks}
+              disabled={loadingDevices}
             >
               <option value="" disabled>
-                {loadingTanks ? "Loading..." : "Select a tank"}
+                {loadingDevices ? "Loading..." : "Select a device"}
               </option>
-              {tanks.map((t) => {
-                const id = t.id || t.tankId || t;
-                const name = t.name || id;
-                return (
-                  <option key={id} value={id}>
-                    {name}
-                  </option>
-                );
-              })}
+              {devices.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.label}
+                </option>
+              ))}
             </select>
           </label>
 
@@ -179,6 +226,16 @@ export default function History() {
 
           <button className="btn" onClick={loadHistory} disabled={loading || !tankId}>
             {loading ? "Loading…" : "Plot"}
+          </button>
+
+          <button
+            className="btn secondary"
+            type="button"
+            onClick={downloadLatestLog}
+            disabled={!tankId}
+            title="Downloads the most recent NDJSON log file for this controller"
+          >
+            Download latest log
           </button>
         </div>
 

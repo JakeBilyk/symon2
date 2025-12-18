@@ -48,6 +48,29 @@ function updateLiveCache(tankId, family, ip, payload) {
   };
 }
 
+// Ensure util controllers always exist in /api/live, even before first poll,
+// seeded from backend/config/utilityConfig.json (id -> ip)
+function ensureUtilDevicesInLiveCache() {
+  try {
+    const utilCfgPath = path.join(configDir, "utilityConfig.json");
+    if (!fs.existsSync(utilCfgPath)) return;
+
+    const utilCfg = JSON.parse(fs.readFileSync(utilCfgPath, "utf8"));
+    for (const [tankId, ip] of Object.entries(utilCfg || {})) {
+      if (!liveCache[tankId]) {
+        liveCache[tankId] = {
+          family: "util",
+          ip: typeof ip === "string" ? ip : ip?.ip,
+          ts_utc: null,
+          qc: "fail",
+        };
+      }
+    }
+  } catch (e) {
+    console.error("ensureUtilDevicesInLiveCache error:", e.message);
+  }
+}
+
 // ----  "live tanks" filter (applies to controllers) ----
 function liveTanksPath() {
   return path.join(configDir, "liveTanks.json");
@@ -134,14 +157,8 @@ async function readRequestBody(req, limitBytes = 1_048_576) {
   });
 }
 
-function charIsDigit(ch) {
-  return ch >= "0" && ch <= "9";
-}
-
-// Very small parser: "ph" => { fam: null, field: "ph" }
-// "ctrl.ph" => { fam: "ctrl", field: "ph" }, etc.
-// "ph" => { family: null, field: "ph" }
-// "ctrl.ph" => { family: "ctrl", field: "ph" }
+// Very small parser: "ph" => { family: null, field: "ph" }
+// "ctrl.ph" => { family: "ctrl", field: "ph" }, etc.
 function resolveMetricSpec(raw) {
   if (!raw) return null;
   const value = String(raw).trim();
@@ -167,7 +184,6 @@ function resolveMetricSpec(raw) {
 }
 
 // Get NDJSON log files for a tank.
-// New filename format from loggingService:
 // telemetry-<family>-<site>-<tank>-<YYYY-MM-DD>.ndjson
 function getLogFilePathsForTank(tankId) {
   const dir = getLogDirectory();
@@ -177,16 +193,29 @@ function getLogFilePathsForTank(tankId) {
   for (const ent of entries) {
     if (!ent.isFile()) continue;
     if (!ent.name.endsWith(".ndjson")) continue;
-
-    // Tank appears as `-<tankId>-` in the filename
     if (!ent.name.includes(`-${tankId}-`)) continue;
-
     files.push(path.join(dir, ent.name));
   }
 
-  // Optional: sort by filename so days process in order
   files.sort();
   return files;
+}
+
+// ---- log file download helpers ----
+function safeBasename(name) {
+  const s = String(name || "");
+  if (!s) return null;
+  if (s.includes("/") || s.includes("\\") || s.includes("\u0000")) return null;
+  return path.basename(s);
+}
+
+function statToMeta(fullPath) {
+  const st = fs.statSync(fullPath);
+  return {
+    name: path.basename(fullPath),
+    size: st.size,
+    mtime: new Date(st.mtimeMs).toISOString(),
+  };
 }
 
 // Read NDJSON logs and create a time series that matches History.jsx:
@@ -220,12 +249,10 @@ async function readLogSeries(tankId, metricSpec, startMs, endMs) {
       if (!Number.isFinite(t)) continue;
       if (t < startMs || t > endMs) continue;
 
-      // Optional family filter (only applies if your rows include `family`)
       if (metricSpec.family && row.family && row.family !== metricSpec.family) {
         continue;
       }
 
-      // Your logger writes metrics at the top-level, but support older shapes too
       const s = row.s || row.values || row || {};
       const v = s[metricSpec.field];
 
@@ -237,7 +264,95 @@ async function readLogSeries(tankId, metricSpec, startMs, endMs) {
 
   out.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   return out;
-} 
+}
+
+// ---- CO2 config + daily usage helpers ----
+function co2ConfigPath() {
+  return path.join(configDir, "co2Config.json");
+}
+
+function loadCo2Config() {
+  const p = co2ConfigPath();
+  if (!fs.existsSync(p)) return { defaultLpm: 2.5, perTank: {} };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(p, "utf8"));
+    const defaultLpm = Number(parsed?.defaultLpm ?? 2.5);
+    return {
+      defaultLpm: Number.isFinite(defaultLpm) && defaultLpm > 0 ? defaultLpm : 2.5,
+      perTank:
+        parsed?.perTank && typeof parsed.perTank === "object" ? parsed.perTank : {},
+    };
+  } catch {
+    return { defaultLpm: 2.5, perTank: {} };
+  }
+}
+
+async function saveCo2Config(cfg) {
+  const payload = JSON.stringify(cfg, null, 2) + "\n";
+  await fsp.writeFile(co2ConfigPath(), payload, "utf8");
+}
+
+// Compute a delta over a day from a monotonic counter that may reset.
+function computeCounterDelta(values) {
+  let total = 0;
+  let prev = null;
+  for (const v of values) {
+    if (!Number.isFinite(v)) continue;
+    if (prev === null) {
+      prev = v;
+      continue;
+    }
+    const d = v - prev;
+    if (d >= 0) total += d;
+    else total += v; // reset
+    prev = v;
+  }
+  return total;
+}
+
+// Read NDJSON logs for a specific Hawaiʻi day and return "seconds on" as a delta of a counter-like field.
+async function readDailyCounterSeconds(tankId, field, dayStartIso, dayEndIso) {
+  const files = getLogFilePathsForTank(tankId);
+  if (!files.length) return 0;
+
+  const startMs = Date.parse(dayStartIso);
+  const endMs = Date.parse(dayEndIso);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return 0;
+
+  const samples = [];
+
+  for (const f of files) {
+    let raw = "";
+    try {
+      raw = await fsp.readFile(f, "utf8");
+    } catch {
+      continue;
+    }
+
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line) continue;
+      let row;
+      try {
+        row = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      const t = Date.parse(row.ts_hst || row.ts_utc || row.ts);
+      if (!Number.isFinite(t)) continue;
+      if (t < startMs || t >= endMs) continue;
+
+      const v = row[field];
+      if (typeof v === "number" && Number.isFinite(v)) {
+        samples.push({ t, v });
+      }
+    }
+  }
+
+  samples.sort((a, b) => a.t - b.t);
+  return computeCounterDelta(samples.map((s) => s.v));
+}
+
 async function handleApiRequest(req, res) {
   setCorsHeaders(res);
 
@@ -252,6 +367,9 @@ async function handleApiRequest(req, res) {
 
   // --- live snapshot endpoint ---
   if (req.method === "GET" && pathname === "/api/live") {
+    // ensure util controllers are always present in response (even if offline)
+    ensureUtilDevicesInLiveCache();
+
     const tankId = searchParams.get("tankId");
     if (tankId) {
       const entry = liveCache[tankId] || null;
@@ -303,6 +421,76 @@ async function handleApiRequest(req, res) {
     return;
   }
 
+  // --- list recent NDJSON log files for a tank/device ---
+  if (req.method === "GET" && pathname === "/api/log-files") {
+    const tankId = searchParams.get("tankId");
+    if (!tankId) {
+      sendError(res, 400, "tankId query parameter is required");
+      return;
+    }
+
+    const limitRaw = searchParams.get("limit");
+    const limit = Math.max(1, Math.min(50, Number(limitRaw || 14)));
+
+    try {
+      const files = getLogFilePathsForTank(tankId)
+        .map((p) => ({ full: p, meta: statToMeta(p) }))
+        .sort((a, b) => Date.parse(b.meta.mtime) - Date.parse(a.meta.mtime))
+        .slice(0, limit)
+        .map((x) => x.meta);
+
+      sendJson(res, 200, { tankId, files });
+    } catch (err) {
+      console.error("GET /api/log-files error:", err.message || err);
+      sendError(res, 500, "Failed to list log files");
+    }
+    return;
+  }
+
+  // --- download a specific NDJSON log file (validated) ---
+  if (req.method === "GET" && pathname === "/api/log-files/download") {
+    const tankId = searchParams.get("tankId");
+    const file = safeBasename(searchParams.get("file"));
+
+    if (!tankId) {
+      sendError(res, 400, "tankId query parameter is required");
+      return;
+    }
+    if (!file) {
+      sendError(res, 400, "file query parameter is required");
+      return;
+    }
+
+    if (!file.includes(`-${tankId}-`) || !file.endsWith(".ndjson")) {
+      sendError(res, 400, "Invalid file for tank");
+      return;
+    }
+
+    const dir = getLogDirectory();
+    const fullPath = path.join(dir, file);
+
+    const resolvedDir = path.resolve(dir) + path.sep;
+    const resolvedFile = path.resolve(fullPath);
+    if (!resolvedFile.startsWith(resolvedDir)) {
+      sendError(res, 400, "Invalid file path");
+      return;
+    }
+
+    if (!fs.existsSync(resolvedFile)) {
+      sendError(res, 404, "File not found");
+      return;
+    }
+
+    res.statusCode = 200;
+    setCorsHeaders(res);
+    setSecurityHeaders(res);
+    res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${file}"`);
+
+    fs.createReadStream(resolvedFile).pipe(res);
+    return;
+  }
+
   if (req.method === "GET" && pathname === "/api/logs") {
     const tankId = searchParams.get("tankId");
     if (!tankId) {
@@ -344,7 +532,7 @@ async function handleApiRequest(req, res) {
     return;
   }
 
-  // --- NEW: Alarm thresholds API ---
+  // --- Alarm thresholds API ---
   if (req.method === "GET" && pathname === "/api/alarm-thresholds") {
     try {
       const thresholds = getAlarmThresholds();
@@ -365,13 +553,95 @@ async function handleApiRequest(req, res) {
     } catch (err) {
       console.error("POST /api/alarm-thresholds error:", err.message || err);
       const message = err?.message || "Invalid alarm thresholds";
-      const status =
-        /must be|Missing|payload must be/i.test(message) ? 400 : 500;
+      const status = /must be|Missing|payload must be/i.test(message) ? 400 : 500;
       sendError(res, status, message);
     }
     return;
   }
-  // --- end alarm thresholds API ---
+
+  // --- CO2 config API ---
+  if (req.method === "GET" && pathname === "/api/co2/config") {
+    try {
+      const cfg = loadCo2Config();
+      sendJson(res, 200, cfg);
+    } catch (err) {
+      console.error("GET /api/co2/config error:", err.message || err);
+      sendError(res, 500, "Failed to read CO2 config");
+    }
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/co2/config") {
+    try {
+      const body = await readRequestBody(req);
+      const parsed = body ? JSON.parse(body) : {};
+      const cfg = {
+        defaultLpm: Number(parsed?.defaultLpm ?? 2.5),
+        perTank:
+          parsed?.perTank && typeof parsed.perTank === "object" ? parsed.perTank : {},
+      };
+
+      if (!Number.isFinite(cfg.defaultLpm) || cfg.defaultLpm <= 0) {
+        sendError(res, 400, "defaultLpm must be a positive number");
+        return;
+      }
+
+      await saveCo2Config(cfg);
+      sendJson(res, 200, cfg);
+    } catch (err) {
+      console.error("POST /api/co2/config error:", err.message || err);
+      sendError(res, 400, err?.message || "Invalid CO2 config");
+    }
+    return;
+  }
+
+  // --- CO2 daily usage ---
+  // GET /api/co2/daily?tankId=Carbonator&date=YYYY-MM-DD&field=timer_seconds
+  if (req.method === "GET" && pathname === "/api/co2/daily") {
+    const tankId = searchParams.get("tankId");
+    const date = searchParams.get("date"); // YYYY-MM-DD (HST day)
+    const field = searchParams.get("field") || "timer_seconds";
+
+    if (!tankId) {
+      sendError(res, 400, "tankId query parameter is required");
+      return;
+    }
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      sendError(res, 400, "date must be YYYY-MM-DD");
+      return;
+    }
+
+    const cfg = loadCo2Config();
+    const lpmRaw = cfg?.perTank?.[tankId] ?? cfg.defaultLpm;
+    const lpm = Number(lpmRaw);
+
+    if (!Number.isFinite(lpm) || lpm <= 0) {
+      sendError(res, 400, "Configured LPM must be a positive number");
+      return;
+    }
+
+    const dayStartIso = `${date}T00:00:00-10:00`;
+    const dayEndIso = `${date}T24:00:00-10:00`;
+
+    try {
+      const secondsOn = await readDailyCounterSeconds(tankId, field, dayStartIso, dayEndIso);
+      const liters = (secondsOn / 60) * lpm;
+
+      sendJson(res, 200, {
+        tankId,
+        date,
+        field,
+        lpm,
+        secondsOn,
+        minutesOn: secondsOn / 60,
+        liters,
+      });
+    } catch (err) {
+      console.error("GET /api/co2/daily error:", err.message || err);
+      sendError(res, 500, "Failed to compute daily CO2 usage");
+    }
+    return;
+  }
 
   sendError(res, 404, "Not found");
 }
@@ -380,7 +650,6 @@ let apiServer;
 
 // ---- MQTT wiring ----
 const mqttClient = createMqttClient(process.env);
-
 
 // ---- family discovery ----
 // Map config filename to (family id, register map path)
@@ -407,7 +676,6 @@ function loadFamilies() {
     const cfgPath = path.join(configDir, fn);
     const devicesJson = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
 
-    // Normalize device list
     const list = Object.entries(devicesJson).map(([tankId, v]) => {
       if (typeof v === "string") return { tankId, ip: v, unitId: 1 };
       return { tankId, ip: v.ip, unitId: v.unitId ?? 1 };
@@ -424,13 +692,12 @@ function loadFamilies() {
       continue;
     }
 
-    // Load register map + read blocks for this family
     const mapCtx = loadRegisterMap(spec.mapFile);
     const blocks = getBlocks(mapCtx);
 
     out.push({
-      family: spec.family, // "ctrl" | "util" | "bmm"
-      devicePrefix: spec.family, // used to build device_id
+      family: spec.family,
+      devicePrefix: spec.family,
       mapCtx,
       blocks,
       devices: filtered,
@@ -463,23 +730,19 @@ async function pollDevice(mqttClient, family, device) {
       s: values,
       qc: { status: "ok" },
     };
+
     updateLiveCache(tankId, fam, ip, payload);
 
     publishTelemetry(mqttClient, payload, fam);
     processTelemetryForAlarms(payload, fam);
 
-    // Friendly per-family log
     if (fam === "ctrl" || fam === "util") {
       console.log(
-        `✅ ${fam}:${tankId} @ ${ip} → pH=${fmt(values.ph)} temp=${fmt(
-          values.temp1_C,
-        )}C`,
+        `✅ ${fam}:${tankId} @ ${ip} → pH=${fmt(values.ph)} temp=${fmt(values.temp1_C)}C`,
       );
     } else if (fam === "bmm") {
       console.log(
-        `✅ bmm:${tankId} @ ${ip} → biomass=${fmt(values.biomass)} ch_clear=${fmt(
-          values.ch_clear,
-        )}`,
+        `✅ bmm:${tankId} @ ${ip} → biomass=${fmt(values.biomass)} ch_clear=${fmt(values.ch_clear)}`,
       );
     } else {
       console.log(`✅ ${fam}:${tankId} @ ${ip}`);
@@ -495,10 +758,10 @@ async function pollDevice(mqttClient, family, device) {
       qc: { status: "fail", error: e.message },
     };
 
-    // Publish fail frame so downstream can detect staleness
-    publishTelemetry(mqttClient, failPayload, fam);
+    // IMPORTANT: update live cache on failure too (so util stays visible + status updates)
+    updateLiveCache(tankId, fam, ip, failPayload);
 
-    // NEW: fire QC fail alarms
+    publishTelemetry(mqttClient, failPayload, fam);
     processTelemetryForAlarms(failPayload, fam, { error: e });
 
     console.error(`❌ ${family.family}:${tankId} @ ${ip}: ${e.message}`);
@@ -517,9 +780,7 @@ async function pollAllFamilies(mqttClient, families) {
       const idx = i++;
       if (idx >= work.length) break;
       const { f, d } = work[idx];
-      // tiny jitter to avoid Wi-Fi bursts
-      if (idx % 3 === 0)
-        await new Promise((r) => setTimeout(r, Math.random() * 200));
+      if (idx % 3 === 0) await new Promise((r) => setTimeout(r, Math.random() * 200));
       await pollDevice(mqttClient, f, d);
     }
   }
@@ -535,9 +796,7 @@ console.log(
   `👟 Gateway starting: site=${SITE_ID}, interval=${POLL_MS}ms, concurrency=${CONCURRENCY}`,
 );
 console.log(
-  `📦 Families loaded: ${families
-    .map((f) => `${f.family}(${f.devices.length})`)
-    .join(", ")}`,
+  `📦 Families loaded: ${families.map((f) => `${f.family}(${f.devices.length})`).join(", ")}`,
 );
 
 let lastReload = Date.now();
@@ -549,9 +808,7 @@ async function tick() {
     try {
       families = loadFamilies();
       console.log(
-        `🔁 Families reloaded: ${families
-          .map((f) => `${f.family}(${f.devices.length})`)
-          .join(", ")}`,
+        `🔁 Families reloaded: ${families.map((f) => `${f.family}(${f.devices.length})`).join(", ")}`,
       );
     } catch (e) {
       console.error("Family reload error:", e.message);
